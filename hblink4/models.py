@@ -20,7 +20,7 @@ import asyncio
 from dataclasses import dataclass, field
 from time import time
 from random import randint
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 
 # Import utils functions that these models depend on
 try:
@@ -49,6 +49,8 @@ class OutboundConnectionConfig:
     # the link boundary. Defaults off because peers may not share our unit
     # call model.
     unit_calls_enabled: bool = False
+    # Transport protocol: "udp" (default) or "sctp"
+    transport: str = "udp"
 
     # Metadata fields with defaults
     callsign: str = ""
@@ -150,7 +152,12 @@ class OutboundState:
     missed_pongs: int = 0  # Consecutive missed pongs
     salt: int = 0  # Challenge salt from MSTCL
     connection_task: Optional[asyncio.Task] = None  # Connection management task
-    transport: Optional[asyncio.DatagramTransport] = None  # UDP transport
+    transport: Optional[asyncio.BaseTransport] = None  # UDP or SCTP transport
+
+    # Transport abstraction: callable that sends bytes to the remote server.
+    # UDP: transport.sendto, SCTP: transport.write
+    send: Optional[Callable[[bytes], None]] = field(default=None, repr=False)
+    transport_type: str = 'udp'
     
     # Talkgroup filtering (stored as bytes sets for hot path performance)
     # None = no restrictions (allow all), empty set = deny all
@@ -223,6 +230,13 @@ class RepeaterState:
     # Connection type detected from software_id
     # Values: 'repeater', 'hotspot', 'network', 'unknown'
     connection_type: str = 'unknown'
+
+    # Transport abstraction: callable that sends bytes to this repeater.
+    # UDP: closes over (udp_transport, addr), SCTP: transport.write
+    send: Optional[Callable[[bytes], None]] = field(default=None, repr=False)
+    # Per-connection transport reference (SCTP only; None for UDP)
+    _transport: Optional[asyncio.BaseTransport] = field(default=None, repr=False)
+    transport_type: str = 'udp'
     
     # Metadata fields with defaults - stored as bytes to match protocol
     callsign: bytes = b''

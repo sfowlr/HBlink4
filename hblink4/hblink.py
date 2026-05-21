@@ -128,6 +128,10 @@ class HBProtocol(asyncio.DatagramProtocol):
         self._tasks = []  # List to track all async tasks
 
         self._port = None  # Store the port instance instead of transport
+
+        # SCTP transport registry: normalized (ip, port) → asyncio.Transport
+        # Used by _send_packet for pre-auth messages to SCTP peers
+        self._sctp_transports: Dict[tuple, asyncio.BaseTransport] = {}
         
         # Initialize dashboard event emitter with config
         dashboard_config = CONFIG.get('dashboard', {})
@@ -184,9 +188,22 @@ class HBProtocol(asyncio.DatagramProtocol):
         RepeaterState.sockaddr is already normalized, so we only normalize the incoming address.
         """
         return repeater.sockaddr == normalize_addr(addr)
-    
 
-    
+    def _init_repeater_send(self, repeater: RepeaterState, addr: PeerAddress) -> None:
+        """Set up transport-appropriate send callable on a RepeaterState.
+
+        For SCTP peers (found in _sctp_transports), stores the per-connection
+        transport.write. For UDP, closes over the shared transport + addr.
+        """
+        normalized = normalize_addr(addr)
+        sctp_transport = self._sctp_transports.get(normalized)
+        if sctp_transport is not None:
+            repeater.send = sctp_transport.write
+            repeater._transport = sctp_transport
+            repeater.transport_type = 'sctp'
+        else:
+            repeater.send = lambda data, _a=normalized, _t=self.transport: _t.sendto(data, _a)
+
     def _format_tg_display(self, tg_set: Optional[set]) -> str:
         """Format TG set for human-readable display (logging)"""
         if tg_set is None:
@@ -343,18 +360,20 @@ class HBProtocol(asyncio.DatagramProtocol):
         
         while True:
             try:
+                use_sctp = config.transport == 'sctp'
+
                 # Phase 1: DNS Resolution
                 LOGGER.info(f'[{config.name}] Resolving {config.address}...')
                 try:
-                    # Use getaddrinfo for DNS resolution
+                    sock_type = socket.SOCK_STREAM if use_sctp else socket.SOCK_DGRAM
                     addr_info = await loop.getaddrinfo(
                         config.address, config.port,
                         family=0,  # AF_UNSPEC - allow IPv4 or IPv6
-                        type=socket.SOCK_DGRAM
+                        type=sock_type
                     )
                     if not addr_info:
                         raise Exception(f'DNS resolution failed for {config.address}')
-                    
+
                     # Use first result
                     family, socktype, proto, canonname, sockaddr = addr_info[0]
                     ip = sockaddr[0]
@@ -362,7 +381,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                     LOGGER.info(f'[{config.name}] Resolved {config.address} → {ip}:{port}')
                 except Exception as e:
                     LOGGER.error(f'[{config.name}] DNS resolution failed: {e}')
-                    
+
                     # Emit error event
                     self._events.emit('outbound_error', {
                         'connection_name': config.name,
@@ -371,20 +390,32 @@ class HBProtocol(asyncio.DatagramProtocol):
                         'remote_port': config.port,
                         'error_message': f'DNS resolution failed: {e}'
                     })
-                    
+
                     await asyncio.sleep(keepalive_interval)
                     continue
-                
-                # Phase 2: Create UDP endpoint
+
+                # Phase 2: Create transport endpoint
                 try:
-                    # Create a connected UDP socket with our custom protocol that knows its connection name
-                    transport, protocol = await loop.create_datagram_endpoint(
-                        lambda: OutboundProtocol(self, config.name),
-                        remote_addr=(ip, port)
-                    )
-                    LOGGER.info(f'[{config.name}] UDP endpoint created to {ip}:{port}')
+                    if use_sctp:
+                        from .sctp import SCTP_AVAILABLE, create_sctp_connect_socket, SCTPOutboundProtocol
+                        if not SCTP_AVAILABLE:
+                            raise RuntimeError('SCTP not available on this system')
+                        sctp_sock = create_sctp_connect_socket(ip)
+                        await loop.sock_connect(sctp_sock, (ip, port))
+                        transport, protocol = await loop.create_connection(
+                            lambda: SCTPOutboundProtocol(self, config.name),
+                            sock=sctp_sock
+                        )
+                        LOGGER.info(f'[{config.name}] SCTP connection created to {ip}:{port}')
+                    else:
+                        transport, protocol = await loop.create_datagram_endpoint(
+                            lambda: OutboundProtocol(self, config.name),
+                            remote_addr=(ip, port)
+                        )
+                        LOGGER.info(f'[{config.name}] UDP endpoint created to {ip}:{port}')
                 except Exception as e:
-                    LOGGER.error(f'[{config.name}] Failed to create UDP endpoint: {e}')
+                    transport_name = 'SCTP' if use_sctp else 'UDP'
+                    LOGGER.error(f'[{config.name}] Failed to create {transport_name} endpoint: {e}')
                     
                     # Emit error event
                     self._events.emit('outbound_error', {
@@ -392,12 +423,12 @@ class HBProtocol(asyncio.DatagramProtocol):
                         'radio_id': config.radio_id,
                         'remote_address': config.address,
                         'remote_port': port,
-                        'error_message': f'Failed to create UDP endpoint: {e}'
+                        'error_message': f'Failed to create {transport_name} endpoint: {e}'
                     })
-                    
+
                     await asyncio.sleep(keepalive_interval)
                     continue
-                
+
                 # Create outbound state
                 slot1_tgs, slot2_tgs = self._parse_options(config.options)
                 state = OutboundState(
@@ -408,15 +439,20 @@ class HBProtocol(asyncio.DatagramProtocol):
                     slot1_talkgroups=slot1_tgs,
                     slot2_talkgroups=slot2_tgs
                 )
-                
+                if use_sctp:
+                    state.send = transport.write
+                    state.transport_type = 'sctp'
+                else:
+                    state.send = transport.sendto
+
                 # Store in dictionaries
                 self._outbounds[config.name] = state
                 self._outbound_by_id[config.radio_id.to_bytes(4, 'big')] = config.name
-                
+
                 # Phase 3: Login (RPTL)
                 our_id_bytes = config.radio_id.to_bytes(4, 'big')
                 rptl_packet = RPTL + our_id_bytes
-                transport.sendto(rptl_packet)
+                state.send(rptl_packet)
                 LOGGER.info(f'[{config.name}] Sent RPTL (login) with ID {config.radio_id}')
                 
                 # Wait for MSTCL (challenge) with salt
@@ -432,12 +468,12 @@ class HBProtocol(asyncio.DatagramProtocol):
                     # If not authenticated yet, retry RPTL
                     if not state.authenticated:
                         rptl_packet = RPTL + our_id_bytes
-                        state.transport.sendto(rptl_packet)
+                        state.send(rptl_packet)
                         LOGGER.debug(f'[{config.name}] Retrying RPTL (login) - no response yet')
                     else:
                         # Send RPTPING if authenticated
                         ping_packet = RPTPING + our_id_bytes
-                        state.transport.sendto(ping_packet)
+                        state.send(ping_packet)
                         state.last_ping = time()
                         LOGGER.debug(f'[{config.name}] Sent RPTPING')
                         
@@ -472,12 +508,12 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # Cleanup
                 if config.name in self._outbounds:
                     state = self._outbounds[config.name]
-                    if state.transport and state.authenticated:
+                    if state.send and state.authenticated:
                         # Send RPTCL (disconnect) to cleanly close connection
                         try:
                             our_id_bytes = config.radio_id.to_bytes(4, 'big')
                             rptcl_packet = RPTCL + our_id_bytes
-                            state.transport.sendto(rptcl_packet)
+                            state.send(rptcl_packet)
                             LOGGER.info(f'[{config.name}] Sent RPTCL (disconnect)')
                             await asyncio.sleep(0.1)  # Brief delay to let packet send
                         except Exception as e:
@@ -540,7 +576,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                     sha256(salt_bytes + state.config.passphrase.encode()).hexdigest()
                 )
                 rptk_packet = RPTK + our_id_bytes + calc_hash
-                state.transport.sendto(rptk_packet)
+                state.send(rptk_packet)
                 state.auth_sent = True  # Mark that we sent RPTK
                 LOGGER.info(f'[{connection_name}] Sent RPTK (auth response)')
             
@@ -661,16 +697,16 @@ class HBProtocol(asyncio.DatagramProtocol):
         packet += config.software_id.encode().ljust(40, b'\x00')[:40]
         packet += config.package_id.encode().ljust(40, b'\x00')[:40]
         
-        state.transport.sendto(packet)
+        state.send(packet)
         LOGGER.info(f'[{config.name}] Sent RPTC (config)')
-    
+
     def _send_outbound_options(self, state: OutboundState, addr: tuple):
         """Send RPTO (options) to outbound server"""
         our_id_bytes = state.config.radio_id.to_bytes(4, 'big')
         options_bytes = state.config.options.encode().ljust(300, b'\x00')[:300]
-        
+
         packet = RPTO + our_id_bytes + options_bytes
-        state.transport.sendto(packet)
+        state.send(packet)
         LOGGER.info(f'[{state.config.name}] Sent RPTO (options): {state.config.options}')
     
     def _handle_outbound_dmr_data(self, data: bytes, outbound_state: OutboundState):
@@ -867,7 +903,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 and out_dst != _dst_id
             )
             if header_unchanged and not lc_needs_rewrite:
-                self._send_packet(data, local_repeater.sockaddr)
+                local_repeater.send(data)
             else:
                 buf = bytearray(data)
                 if out_dst != _dst_id:
@@ -895,7 +931,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                         buf[20:53] = splice_full_lc(payload, t_lc)
                     elif lc_carrier == LC_CARRIER_EMB:
                         buf[20:53] = splice_emb_lc(payload, emb_lc[_dtype_vseq])
-                self._send_packet(bytes(buf), local_repeater.sockaddr)
+                local_repeater.send(bytes(buf))
             forwarded_count += 1
 
             # Track assumed stream state on local repeater using target-local values
@@ -1037,7 +1073,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             if not target_repeater:
                 continue
             # No translation for unit calls — just forward the packet.
-            self._send_packet(data, target_repeater.sockaddr)
+            target_repeater.send(data)
             self._update_assumed_stream(
                 target_repeater, _slot, _rf_src, _dst_id, _stream_id,
                 is_terminator, remote_repeater_id,
@@ -1060,23 +1096,21 @@ class HBProtocol(asyncio.DatagramProtocol):
         LOGGER.info("Starting graceful shutdown...")
         
         # Send MSTCL to all connected repeaters
-        if self._port:  # Only attempt to send if we have a port
-            for repeater_id, repeater in self._repeaters.items():
-                if repeater.connection_state == 'connected':
-                    try:
-                        LOGGER.info(f"Sending disconnect to repeater {rid_to_int(repeater_id)}")
-                        # asyncio uses sendto() instead of write(data, addr)
-                        self._port.sendto(MSTCL, repeater.sockaddr)
-                    except Exception as e:
-                        LOGGER.error(f"Error sending disconnect to repeater {rid_to_int(repeater_id)}: {e}")
-        
+        for repeater_id, repeater in self._repeaters.items():
+            if repeater.connection_state == 'connected' and repeater.send:
+                try:
+                    LOGGER.info(f"Sending disconnect to repeater {rid_to_int(repeater_id)}")
+                    repeater.send(MSTCL)
+                except Exception as e:
+                    LOGGER.error(f"Error sending disconnect to repeater {rid_to_int(repeater_id)}: {e}")
+
         # Send RPTCL (disconnect) to all outbound connections
         for conn_name, outbound in list(self._outbounds.items()):
-            if outbound.authenticated and outbound.transport:
+            if outbound.authenticated and outbound.send:
                 try:
                     LOGGER.info(f"Sending disconnect to outbound connection '{conn_name}'")
                     our_id_bytes = outbound.config.radio_id.to_bytes(4, 'big')
-                    outbound.transport.sendto(RPTCL + our_id_bytes)
+                    outbound.send(RPTCL + our_id_bytes)
                     
                     # Emit disconnection event
                     self._events.emit('outbound_disconnected', {
@@ -1089,6 +1123,15 @@ class HBProtocol(asyncio.DatagramProtocol):
                 except Exception as e:
                     LOGGER.error(f"Error sending disconnect to outbound '{conn_name}': {e}")
         
+        # Close SCTP per-connection transports (UDP has no per-connection transport)
+        for repeater_id, repeater in self._repeaters.items():
+            if repeater._transport:
+                try:
+                    repeater._transport.close()
+                except Exception:
+                    pass
+        self._sctp_transports.clear()
+
         # Cancel all outbound connection tasks
         for conn_name, outbound in self._outbounds.items():
             if outbound.connection_task and not outbound.connection_task.done():
@@ -1097,7 +1140,7 @@ class HBProtocol(asyncio.DatagramProtocol):
 
         # Give time for disconnects to be sent
         import time
-        time.sleep(0.5)  # 500ms should be enough for UDP packets to be sent
+        time.sleep(0.5)  # 500ms should be enough for packets to be sent
 
     async def _run_periodic(self, interval: float, func, name: str):
         """
@@ -2599,8 +2642,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                     repeater = RepeaterState(repeater_id=repeater_id, ip=ip, port=port)
                     repeater.salt = existing_salt  # Reuse same salt
                     repeater.connection_state = 'login'
+                    self._init_repeater_send(repeater, addr)
                     self._repeaters[repeater_id] = repeater
-                    
+
                     # Send login ACK with same salt
                     salt_bytes = repeater.salt.to_bytes(4, 'big')
                     self._send_packet(b''.join([RPTACK, salt_bytes]), addr)
@@ -2610,6 +2654,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Create or update repeater state (fresh login)
         repeater = RepeaterState(repeater_id=repeater_id, ip=ip, port=port)
         repeater.connection_state = 'login'
+        self._init_repeater_send(repeater, addr)
         self._repeaters[repeater_id] = repeater
         
         # Send login ACK with salt
@@ -3555,7 +3600,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # Outbound server speaks network-side vocabulary — no local remap.
                 our_id_bytes = outbound.config.radio_id.to_bytes(4, 'big')
                 packet = build_target_packet(net_slot, net_dst_id, net_rf_src, our_id_bytes)
-                outbound.transport.sendto(packet)
+                outbound.send(packet)
 
                 # Track assumed stream state on outbound slot (TDMA constraint)
                 # We must track what we're transmitting on each timeslot
@@ -3587,10 +3632,10 @@ class HBProtocol(asyncio.DatagramProtocol):
                         and not source_translated
                         and (out_slot, out_dst) == (slot, dst_id)
                         and net_rf_src == rf_src):
-                    self._send_packet(data, target_repeater.sockaddr)
+                    target_repeater.send(data)
                 else:
                     packet = build_target_packet(out_slot, out_dst, net_rf_src, None)
-                    self._send_packet(packet, target_repeater.sockaddr)
+                    target_repeater.send(packet)
 
                 # Track assumed stream state on target repeater using target-local values
                 self._update_assumed_stream(target_repeater, out_slot, net_rf_src, out_dst,
@@ -3858,12 +3903,13 @@ class HBProtocol(asyncio.DatagramProtocol):
 
 
     def _send_packet(self, data: bytes, addr: tuple):
-        """Send packet to specified address"""
-        cmd = data[:4]
-        #if cmd != DMRD:  # Don't log DMR data packets
-        #    LOGGER.debug(f'Sending {cmd.decode()} to {addr[0]}:{addr[1]}')
-        # asyncio uses sendto() instead of write(data, addr)
-        self.transport.sendto(data, normalize_addr(addr))
+        """Send packet to specified address (UDP) or via stored transport (SCTP)"""
+        normalized = normalize_addr(addr)
+        sctp_transport = self._sctp_transports.get(normalized)
+        if sctp_transport is not None:
+            sctp_transport.write(data)
+        else:
+            self.transport.sendto(data, normalized)
 
     def _send_nak(self, repeater_id: bytes, addr: tuple, reason: str = None, is_shutdown: bool = False):
         """Send NAK to specified address
@@ -3960,7 +4006,42 @@ async def async_main():
     if not transports:
         LOGGER.error('Failed to bind to any interface')
         sys.exit(1)
-    
+
+    # Optional SCTP listeners (share state with the primary HBProtocol instance)
+    sctp_servers = []
+    if CONFIG['global'].get('sctp_enabled', False):
+        from .sctp import SCTP_AVAILABLE, create_sctp_listen_socket, SCTPInboundProtocol
+        if not SCTP_AVAILABLE:
+            LOGGER.warning('⚠️  SCTP enabled in config but not available on this system (requires Linux kernel module)')
+        else:
+            primary_protocol = protocols[0]
+            sctp_port_v4 = CONFIG['global'].get('sctp_port_ipv4', port_ipv4)
+            sctp_port_v6 = CONFIG['global'].get('sctp_port_ipv6', port_ipv6)
+
+            if bind_ipv4:
+                try:
+                    sctp_sock = create_sctp_listen_socket(bind_ipv4, sctp_port_v4)
+                    sctp_server = await loop.create_server(
+                        lambda: SCTPInboundProtocol(primary_protocol),
+                        sock=sctp_sock
+                    )
+                    sctp_servers.append(sctp_server)
+                    LOGGER.info(f'✓ HBlink4 listening on {bind_ipv4}:{sctp_port_v4} (SCTP, IPv4)')
+                except Exception as e:
+                    LOGGER.error(f'✗ Failed to bind SCTP IPv4 to {bind_ipv4}:{sctp_port_v4}: {e}')
+
+            if bind_ipv6 and not disable_ipv6:
+                try:
+                    sctp_sock = create_sctp_listen_socket(bind_ipv6, sctp_port_v6)
+                    sctp_server = await loop.create_server(
+                        lambda: SCTPInboundProtocol(primary_protocol),
+                        sock=sctp_sock
+                    )
+                    sctp_servers.append(sctp_server)
+                    LOGGER.info(f'✓ HBlink4 listening on [{bind_ipv6}]:{sctp_port_v6} (SCTP, IPv6)')
+                except Exception as e:
+                    LOGGER.error(f'✗ Failed to bind SCTP IPv6 to [{bind_ipv6}]:{sctp_port_v6}: {e}')
+
     # Parse and validate outbound connections
     outbound_configs = parse_outbound_connections()
     
@@ -4006,6 +4087,9 @@ async def async_main():
         # Cleanup all protocols (cleanup() logs "Starting graceful shutdown...")
         for protocol in protocols:
             protocol.cleanup()
+        # Close SCTP listening servers
+        for srv in sctp_servers:
+            srv.close()
         # Signal the event loop to exit
         shutdown_event.set()
     

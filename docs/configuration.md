@@ -35,7 +35,10 @@ The `global` section contains server-wide settings that control the basic operat
         "stream_hang_time": 10.0,
         "user_cache": {
             "timeout": 600
-        }
+        },
+        "sctp_enabled": false,
+        "sctp_port_ipv4": 62031,
+        "sctp_port_ipv6": 62031
     }
 }
 ```
@@ -49,6 +52,9 @@ The `global` section contains server-wide settings that control the basic operat
 | `bind_ipv6` | string | IPv6 address to bind ("::" for all IPv6 interfaces) |
 | `port_ipv4` | number | UDP port for IPv4 (default: 62031) |
 | `port_ipv6` | number | UDP port for IPv6 (default: 62031) |
+| `sctp_enabled` | boolean | Enable SCTP listeners alongside UDP (default: false). Requires Linux kernel SCTP support (`modprobe sctp`). Falls back to UDP-only if unavailable. |
+| `sctp_port_ipv4` | number | SCTP port for IPv4 (default: same as `port_ipv4`). Can be the same as the UDP port since they're different protocols. |
+| `sctp_port_ipv6` | number | SCTP port for IPv6 (default: same as `port_ipv6`) |
 | `logging.file` | string | Path to log file |
 | `logging.console_level` | string | Logging level for console output ("DEBUG", "INFO", "WARNING", "ERROR") |
 | `logging.file_level` | string | Logging level for file output ("DEBUG", "INFO", "WARNING", "ERROR") |
@@ -101,6 +107,50 @@ If you see an error like "address already in use" when binding IPv6 with the sam
 "port_ipv4": 62031,
 "port_ipv6": 62031
 ```
+
+### SCTP Transport (Optional)
+
+HBlink4 can optionally listen for inbound connections via **SCTP** (Stream Control Transmission Protocol) alongside the default UDP listeners. SCTP provides:
+
+- **Message boundaries preserved** (like UDP) — no framing or reassembly needed
+- **Connection-oriented** (like TCP) — connection_made/connection_lost lifecycle
+- **Built-in heartbeat detection** — kernel detects dead peers automatically
+- **SCTP_NODELAY** always enabled — no Nagle buffering of small DMR packets
+
+**Requirements:**
+- Linux kernel with SCTP support: `sudo modprobe sctp`
+- macOS does **not** support SCTP — the server logs a warning and continues UDP-only
+- The connecting client (MMDVMHost) must also support SCTP
+
+**Configuration:**
+```json
+{
+    "global": {
+        "sctp_enabled": true,
+        "sctp_port_ipv4": 62031,
+        "sctp_port_ipv6": 62031
+    }
+}
+```
+
+SCTP and UDP listeners run simultaneously — repeaters can connect via either protocol. SCTP ports can be the same as UDP ports since they are different protocols and don't conflict.
+
+For outbound connections, set `"transport": "sctp"` on the individual connection:
+```json
+{
+    "outbound_connections": [
+        {
+            "name": "Master-Server",
+            "address": "master.example.com",
+            "port": 62031,
+            "transport": "sctp",
+            ...
+        }
+    ]
+}
+```
+
+> ℹ️ **Application-level keepalives (RPTPING/MSTPONG) are still used with SCTP.** The HomeBrew protocol state machine requires them regardless of transport. SCTP heartbeats provide an additional layer of dead-peer detection at the kernel level.
 
 ## Dashboard Configuration
 
@@ -705,7 +755,7 @@ The `outbound_connections` section is **optional** and defines server-to-server 
 | `enabled` | boolean | Enable/disable this connection without removing it |
 | `name` | string | Unique name for this connection (used in logs) |
 | `address` | string | Hostname or IP address of remote server |
-| `port` | number | UDP port of remote server (typically 62031) |
+| `port` | number | Port of remote server (typically 62031) |
 | `password` | string | Authentication password for remote server |
 | `radio_id` | number | DMR ID to use when connecting (must be unique) |
 
@@ -729,6 +779,7 @@ These fields are sent to the remote server during the RPTC (configuration) hands
 | `software_id` | string | `"HBlink4"` | Software identifier |
 | `package_id` | string | `"HBlink4 v2.0"` | Package version |
 | `unit_calls_enabled` | boolean | `false` | Whether unit (private) calls traverse this outbound link. When `true`, local unit calls fan out over this link and unit calls arriving on it are forwarded to local repeaters. When `false`, unit calls are dropped at the link boundary. Set to `true` only for peers that participate in unit-call routing (e.g. other HBlink4 servers). |
+| `transport` | string | `"udp"` | Transport protocol: `"udp"` (default) or `"sctp"`. SCTP requires Linux kernel support on both ends. The remote server must also be listening on SCTP. |
 
 ### Unit (Private) Call Forwarding
 

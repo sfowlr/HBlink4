@@ -94,7 +94,9 @@ def parse_outbound_connections(config: Dict[str, Any], logger: logging.Logger = 
                 description=conn_dict.get('description', ''),
                 url=conn_dict.get('url', ''),
                 software_id=conn_dict.get('software_id', 'HBlink4'),
-                package_id=conn_dict.get('package_id', 'HBlink4 v2.0')
+                package_id=conn_dict.get('package_id', 'HBlink4 v2.0'),
+                unit_calls_enabled=conn_dict.get('unit_calls_enabled', False),
+                transport=conn_dict.get('transport', 'udp')
             )
             outbound_configs.append(config_obj)
             if logger:

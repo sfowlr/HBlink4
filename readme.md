@@ -22,6 +22,7 @@ HBlink4 focuses on being an efficient **endpoint network server** with the follo
 ## Features
 
 - **Native dual-stack IPv4/IPv6 support** - Simultaneous listening on both protocols for maximum compatibility
+- **Optional SCTP transport** - Connection-oriented alternative to UDP with message boundary preservation and kernel-level heartbeat detection (Linux only, falls back to UDP on other platforms)
 - Modern Python implementation with type hints
 - Improved error handling and logging
 - JSON-based configuration
