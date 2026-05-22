@@ -35,7 +35,8 @@ import sys
 try:
     from .constants import (
         RPTA, RPTL, RPTK, RPTC, RPTCL, MSTCL, DMRD,
-        MSTNAK, MSTPONG, RPTPING, RPTACK, RPTP, RPTO, DMRA
+        MSTNAK, MSTPONG, RPTPING, RPTACK, RPTP, RPTO, DMRA,
+        DMRC, DMRP
     )
     from .access_control import RepeaterMatcher
     from .events import EventEmitter
@@ -66,7 +67,8 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from constants import (
         RPTA, RPTL, RPTK, RPTC, RPTCL, MSTCL, DMRD,
-        MSTNAK, MSTPONG, RPTPING, RPTACK, RPTP, RPTO, DMRA
+        MSTNAK, MSTPONG, RPTPING, RPTACK, RPTP, RPTO, DMRA,
+        DMRC, DMRP
     )
     from access_control import RepeaterMatcher
     from events import EventEmitter
@@ -1804,6 +1806,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 repeater_id = data[4:8]
             elif _command == DMRA:
                 repeater_id = data[4:8]
+            elif _command == DMRC:
+                repeater_id = data[4:8]
             elif _command == RPTC:
                 if data[:5] == RPTCL:
                     repeater_id = data[5:9]
@@ -1829,7 +1833,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             repeater = self._repeaters.get(repeater_id)
             
             # If repeater is not registered and this is not a login or auth packet, send NAK and return
-            if not repeater and _command not in [RPTL, RPTK]:
+            # DMRC is MMDVMHost's no-auth registration (config as first packet)
+            if not repeater and _command not in [RPTL, RPTK, DMRC]:
                 self._send_nak(repeater_id, addr, reason="Repeater not registered")
                 return
 
@@ -1875,6 +1880,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                     self._handle_talker_alias(repeater_id, data[8:], addr)
                 else:
                     LOGGER.warning(f'DMRA packet from {ip}:{port} has no repeater_id - packet hex: {data[:20].hex()}')
+            elif _command == DMRC:
+                LOGGER.debug(f'Received DMRC from {ip}:{port} - MMDVMHost Configuration (packet length: {len(data)})')
+                self._handle_dmrc(repeater_id, data, addr)
             else:
                 # Try to decode the command as ASCII for better logging
                 try:
@@ -2780,6 +2788,115 @@ class HBProtocol(asyncio.DatagramProtocol):
             LOGGER.error(f'Error parsing config: {str(e)}')
             if 'repeater_id' in locals():
                 self._send_nak(repeater_id, addr)
+
+    def _handle_dmrc(self, repeater_id: bytes, data: bytes, addr: PeerAddress) -> None:
+        """Handle DMRC (MMDVMHost protocol variant).
+
+        MMDVMHost uses a simpler no-auth protocol:
+        - Sends DMRC (119 bytes) every 10s as combined config + keepalive
+        - Expects DMRP back as pong
+        - No RPTL/RPTK login handshake
+
+        DMRC packet layout (119 bytes):
+          [0:4]   "DMRC"
+          [4:8]   Repeater ID (4 bytes, binary)
+          [8:16]  Callsign (8 chars, space-padded)
+          [16:25] RX Frequency (9 digits ASCII)
+          [25:34] TX Frequency (9 digits ASCII)
+          [34:36] TX Power (2 digits ASCII)
+          [36:38] Color Code (2 digits ASCII)
+          [38:39] Slots ('0'-'4')
+          [39:79] Software/Version (40 chars, space-padded)
+          [79:119] Hardware/Package (40 chars, space-padded)
+        """
+        ip, port = addr[0], addr[1]
+
+        try:
+            repeater = self._repeaters.get(repeater_id)
+
+            if repeater and repeater.connection_state == 'connected':
+                # Already registered — treat as keepalive, update ping time
+                repeater.last_ping = time()
+                if repeater.missed_pings > 0:
+                    repeater.missed_pings = 0
+                    self._events.emit('repeater_connected',
+                                      self._prepare_repeater_event_data(repeater_id, repeater))
+                else:
+                    repeater.missed_pings = 0
+                # Send pong
+                self._send_packet(b''.join([DMRP, repeater_id]), addr)
+                return
+
+            # New connection or re-registration — check access control
+            repeater_id_int = rid_to_int(repeater_id)
+
+            # Check outbound ID reservation
+            if repeater_id_int in self._outbound_ids:
+                LOGGER.warning(f'⛔ Rejecting DMRC from {repeater_id_int} at {ip}:{port} '
+                               f'- ID reserved for outbound connection')
+                return
+
+            # Check access control (blacklist + pattern match)
+            callsign_raw = data[8:16] if len(data) > 16 else b''
+            callsign_str = callsign_raw.decode('ascii', errors='replace').strip()
+
+            try:
+                repeater_config = self._matcher.get_repeater_config(repeater_id_int, callsign_str)
+            except Exception:
+                repeater_config = None
+
+            if repeater_config is None:
+                LOGGER.warning(f'DMRC from {repeater_id_int} ({callsign_str}) at {ip}:{port} '
+                               f'- no matching config pattern, rejecting')
+                return
+
+            # Create repeater state (auto-authenticated for DMRC protocol)
+            if repeater:
+                # Existing but not connected — remove old state
+                self._remove_repeater(repeater_id, 'dmrc_reconnect')
+
+            repeater = RepeaterState(repeater_id=repeater_id, ip=ip, port=port)
+            repeater.authenticated = True
+            repeater.connection_state = 'connected'
+            repeater.connected = True
+            self._init_repeater_send(repeater, addr)
+            self._repeaters[repeater_id] = repeater
+
+            # Parse DMRC config fields (119-byte format)
+            if len(data) >= 119:
+                repeater.callsign = data[8:16]
+                repeater.rx_freq = data[16:25]
+                repeater.tx_freq = data[25:34]
+                repeater.tx_power = data[34:36]
+                repeater.colorcode = data[36:38]
+                repeater.slots = data[38:39]
+                repeater.software_id = data[39:79]
+                repeater.package_id = data[79:119]
+            elif len(data) >= 16:
+                repeater.callsign = data[8:16]
+
+            # Detect connection type
+            repeater.connection_type = detect_connection_type(
+                getattr(repeater, 'software_id', b''),
+                getattr(repeater, 'package_id', b''),
+                self._config
+            )
+
+            # Load TG config
+            self._load_repeater_tg_config(repeater_id, repeater)
+
+            LOGGER.info(f'Repeater {repeater_id_int} ({callsign_str}) registered via DMRC from {ip}:{port}')
+
+            # Send pong to confirm
+            self._send_packet(b''.join([DMRP, repeater_id]), addr)
+
+            # Emit events
+            self._emit_repeater_details(repeater_id, repeater)
+            self._events.emit('repeater_connected',
+                              self._prepare_repeater_event_data(repeater_id, repeater))
+
+        except Exception as e:
+            LOGGER.error(f'Error handling DMRC from {ip}:{port}: {e}')
 
     def _emit_repeater_details(self, repeater_id: bytes, repeater: RepeaterState) -> None:
         """

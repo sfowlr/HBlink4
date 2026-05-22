@@ -19,6 +19,8 @@ RPTP    = b'RPTP'     # Prefix used to identify RPTPING commands when parsing
 RPTA    = b'RPTA'
 RPTO    = b'RPTO'     # Repeater sending Options
 DMRA    = b'DMRA'     # DMR Talker Alias
+DMRC    = b'DMRC'     # DMR Configuration (MMDVMHost protocol variant, no-auth)
+DMRP    = b'DMRP'     # DMR Pong (MMDVMHost keepalive response)
 
 # Protocol Configuration
 DMR_DATA_PACKET_LENGTH = 55  # Minimum length of valid DMR data packet
