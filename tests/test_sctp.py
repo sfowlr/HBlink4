@@ -30,8 +30,16 @@ class TestSCTPAvailability(unittest.TestCase):
         self.assertIsInstance(result, bool)
 
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS-specific')
-    def test_sctp_unavailable_on_macos(self):
-        self.assertFalse(SCTP_AVAILABLE)
+    def test_no_kernel_sctp_on_macos(self):
+        """macOS has no kernel SCTP. SCTP may still be available via usrsctp."""
+        from hblink4.sctp import SCTP_BACKEND
+        from hblink4.usrsctp_transport import USRSCTP_AVAILABLE
+        # Kernel SCTP is never available on macOS
+        self.assertNotEqual(SCTP_BACKEND, 'kernel')
+        # If SCTP is available at all, it must be via usrsctp
+        if SCTP_AVAILABLE:
+            self.assertEqual(SCTP_BACKEND, 'usrsctp')
+            self.assertTrue(USRSCTP_AVAILABLE)
 
     @unittest.skipUnless(sys.platform == 'linux', 'Linux-specific')
     def test_sctp_may_be_available_on_linux(self):

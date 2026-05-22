@@ -397,16 +397,30 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # Phase 2: Create transport endpoint
                 try:
                     if use_sctp:
-                        from .sctp import SCTP_AVAILABLE, create_sctp_connect_socket, SCTPOutboundProtocol
+                        from .sctp import SCTP_AVAILABLE, SCTP_BACKEND
                         if not SCTP_AVAILABLE:
-                            raise RuntimeError('SCTP not available on this system')
-                        sctp_sock = create_sctp_connect_socket(ip)
-                        await loop.sock_connect(sctp_sock, (ip, port))
-                        transport, protocol = await loop.create_connection(
-                            lambda: SCTPOutboundProtocol(self, config.name),
-                            sock=sctp_sock
-                        )
-                        LOGGER.info(f'[{config.name}] SCTP connection created to {ip}:{port}')
+                            raise RuntimeError('SCTP not available on this system '
+                                               '(requires Linux kernel module or libusrsctp)')
+                        if SCTP_BACKEND == 'kernel':
+                            from .sctp import create_sctp_connect_socket, SCTPOutboundProtocol
+                            sctp_sock = create_sctp_connect_socket(ip)
+                            await loop.sock_connect(sctp_sock, (ip, port))
+                            transport, protocol = await loop.create_connection(
+                                lambda: SCTPOutboundProtocol(self, config.name),
+                                sock=sctp_sock
+                            )
+                        else:
+                            # usrsctp backend
+                            from .usrsctp_transport import usrsctp_connect
+                            encap_port = CONFIG['global'].get('sctp_encap_port', 9899)
+                            encap_mode = CONFIG['global'].get('sctp_encap', 'udp')
+                            effective_encap_port = 0 if encap_mode == 'raw' else encap_port
+                            protocol, _ = await usrsctp_connect(
+                                self, config.name, ip, port,
+                                encap_port=effective_encap_port
+                            )
+                            transport = protocol  # UsrsctpOutboundProtocol has .write()
+                        LOGGER.info(f'[{config.name}] SCTP connection created to {ip}:{port} ({SCTP_BACKEND})')
                     else:
                         transport, protocol = await loop.create_datagram_endpoint(
                             lambda: OutboundProtocol(self, config.name),
@@ -4009,11 +4023,14 @@ async def async_main():
 
     # Optional SCTP listeners (share state with the primary HBProtocol instance)
     sctp_servers = []
+    usrsctp_listeners = []
     if CONFIG['global'].get('sctp_enabled', False):
-        from .sctp import SCTP_AVAILABLE, create_sctp_listen_socket, SCTPInboundProtocol
+        from .sctp import SCTP_AVAILABLE, SCTP_BACKEND
         if not SCTP_AVAILABLE:
-            LOGGER.warning('⚠️  SCTP enabled in config but not available on this system (requires Linux kernel module)')
-        else:
+            LOGGER.warning('⚠️  SCTP enabled in config but not available on this system '
+                           '(requires Linux kernel module or libusrsctp: brew install libusrsctp)')
+        elif SCTP_BACKEND == 'kernel':
+            from .sctp import create_sctp_listen_socket, SCTPInboundProtocol
             primary_protocol = protocols[0]
             sctp_port_v4 = CONFIG['global'].get('sctp_port_ipv4', port_ipv4)
             sctp_port_v6 = CONFIG['global'].get('sctp_port_ipv6', port_ipv6)
@@ -4026,7 +4043,7 @@ async def async_main():
                         sock=sctp_sock
                     )
                     sctp_servers.append(sctp_server)
-                    LOGGER.info(f'✓ HBlink4 listening on {bind_ipv4}:{sctp_port_v4} (SCTP, IPv4)')
+                    LOGGER.info(f'✓ HBlink4 listening on {bind_ipv4}:{sctp_port_v4} (SCTP/kernel, IPv4)')
                 except Exception as e:
                     LOGGER.error(f'✗ Failed to bind SCTP IPv4 to {bind_ipv4}:{sctp_port_v4}: {e}')
 
@@ -4038,9 +4055,44 @@ async def async_main():
                         sock=sctp_sock
                     )
                     sctp_servers.append(sctp_server)
-                    LOGGER.info(f'✓ HBlink4 listening on [{bind_ipv6}]:{sctp_port_v6} (SCTP, IPv6)')
+                    LOGGER.info(f'✓ HBlink4 listening on [{bind_ipv6}]:{sctp_port_v6} (SCTP/kernel, IPv6)')
                 except Exception as e:
                     LOGGER.error(f'✗ Failed to bind SCTP IPv6 to [{bind_ipv6}]:{sctp_port_v6}: {e}')
+
+        elif SCTP_BACKEND == 'usrsctp':
+            from .usrsctp_transport import UsrsctpListener
+            primary_protocol = protocols[0]
+            sctp_port_v4 = CONFIG['global'].get('sctp_port_ipv4', port_ipv4)
+            sctp_port_v6 = CONFIG['global'].get('sctp_port_ipv6', port_ipv6)
+            encap_port = CONFIG['global'].get('sctp_encap_port', 9899)
+            encap_mode = CONFIG['global'].get('sctp_encap', 'udp')
+            effective_encap_port = 0 if encap_mode == 'raw' else encap_port
+
+            if bind_ipv4:
+                try:
+                    listener = UsrsctpListener(
+                        primary_protocol, bind_ipv4, sctp_port_v4,
+                        loop, encap_port=effective_encap_port
+                    )
+                    listener.start()
+                    usrsctp_listeners.append(listener)
+                    encap_label = f'raw' if encap_mode == 'raw' else f'UDP:{encap_port}'
+                    LOGGER.info(f'✓ HBlink4 listening on {bind_ipv4}:{sctp_port_v4} (SCTP/usrsctp [{encap_label}], IPv4)')
+                except Exception as e:
+                    LOGGER.error(f'✗ Failed to start usrsctp listener on {bind_ipv4}:{sctp_port_v4}: {e}')
+
+            if bind_ipv6 and not disable_ipv6:
+                try:
+                    listener = UsrsctpListener(
+                        primary_protocol, bind_ipv6, sctp_port_v6,
+                        loop, encap_port=effective_encap_port
+                    )
+                    listener.start()
+                    usrsctp_listeners.append(listener)
+                    encap_label = f'raw' if encap_mode == 'raw' else f'UDP:{encap_port}'
+                    LOGGER.info(f'✓ HBlink4 listening on [{bind_ipv6}]:{sctp_port_v6} (SCTP/usrsctp [{encap_label}], IPv6)')
+                except Exception as e:
+                    LOGGER.error(f'✗ Failed to start usrsctp listener on [{bind_ipv6}]:{sctp_port_v6}: {e}')
 
     # Parse and validate outbound connections
     outbound_configs = parse_outbound_connections()

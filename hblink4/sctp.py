@@ -33,18 +33,28 @@ IPPROTO_SCTP = 132
 SCTP_NODELAY = 3          # Disable Nagle — critical for low-latency DMR packets
 SCTP_PEER_ADDR_PARAMS = 9 # struct sctp_paddrparams — heartbeat interval tuning
 
-# Probe kernel support at import time
+# Probe kernel support at import time, with userspace fallback
 SCTP_AVAILABLE = False
+SCTP_BACKEND = None  # 'kernel' or 'usrsctp' or None
+
 try:
     _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_SCTP)
     _s.close()
     SCTP_AVAILABLE = True
+    SCTP_BACKEND = 'kernel'
 except (OSError, socket.error):
-    pass
+    # Kernel SCTP unavailable — try userspace fallback (libusrsctp)
+    try:
+        from .usrsctp_transport import USRSCTP_AVAILABLE
+        if USRSCTP_AVAILABLE:
+            SCTP_AVAILABLE = True
+            SCTP_BACKEND = 'usrsctp'
+    except ImportError:
+        pass
 
 
 def check_sctp_available() -> bool:
-    """Return True if the running kernel supports SCTP."""
+    """Return True if any SCTP backend (kernel or usrsctp) is available."""
     return SCTP_AVAILABLE
 
 
