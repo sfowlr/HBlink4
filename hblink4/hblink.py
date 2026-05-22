@@ -1111,12 +1111,15 @@ class HBProtocol(asyncio.DatagramProtocol):
         """Send disconnect messages to all repeaters and cleanup resources."""
         LOGGER.info("Starting graceful shutdown...")
         
-        # Send MSTCL to all connected repeaters
+        # Send disconnect to all connected repeaters
         for repeater_id, repeater in self._repeaters.items():
             if repeater.connection_state == 'connected' and repeater.send:
                 try:
                     LOGGER.info(f"Sending disconnect to repeater {rid_to_int(repeater_id)}")
-                    repeater.send(MSTCL)
+                    if repeater.protocol_variant == 'mmdvm':
+                        pass  # MMDVMHost doesn't understand MSTCL; just drop silently
+                    else:
+                        repeater.send(MSTCL)
                 except Exception as e:
                     LOGGER.error(f"Error sending disconnect to repeater {rid_to_int(repeater_id)}: {e}")
 
@@ -2859,6 +2862,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             repeater.authenticated = True
             repeater.connection_state = 'connected'
             repeater.connected = True
+            repeater.protocol_variant = 'mmdvm'
             self._init_repeater_send(repeater, addr)
             self._repeaters[repeater_id] = repeater
 
@@ -4044,18 +4048,24 @@ class HBProtocol(asyncio.DatagramProtocol):
 
     def _send_nak(self, repeater_id: bytes, addr: tuple, reason: str = None, is_shutdown: bool = False):
         """Send NAK to specified address
-        
+
         Args:
             repeater_id: The repeater's ID
             addr: The address to send the NAK to
             reason: Why the NAK is being sent
             is_shutdown: Whether this NAK is part of a graceful shutdown
         """
+        # Don't send MSTNAK to MMDVM-protocol peers (they don't understand it)
+        repeater = self._repeaters.get(repeater_id)
+        if repeater and repeater.protocol_variant == 'mmdvm':
+            LOGGER.debug(f'Suppressing NAK to MMDVM peer {addr[0]}:{addr[1]} - {reason}')
+            return
+
         log_level = logging.DEBUG if is_shutdown else logging.WARNING
         log_msg = f'Sending NAK to {addr[0]}:{addr[1]} for repeater {rid_to_int(repeater_id)}'
         if reason:
             log_msg += f' - {reason}'
-        
+
         LOGGER.log(log_level, log_msg)
         self._send_packet(b''.join([MSTNAK, repeater_id]), addr)
 

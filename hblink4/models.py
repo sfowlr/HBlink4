@@ -231,6 +231,10 @@ class RepeaterState:
     # Values: 'repeater', 'hotspot', 'network', 'unknown'
     connection_type: str = 'unknown'
 
+    # Protocol variant: 'homebrew' (RPTL/RPTK auth) or 'mmdvm' (DMRC no-auth)
+    # Determines which commands the peer understands.
+    protocol_variant: str = 'homebrew'
+
     # Transport abstraction: callable that sends bytes to this repeater.
     # UDP: closes over (udp_transport, addr), SCTP: transport.write
     send: Optional[Callable[[bytes], None]] = field(default=None, repr=False)
