@@ -216,6 +216,40 @@ A server will, at a minimum, need to track a repeater in the following states:
    **Note**: ETSI sync patterns (bytes 20-25) are not used for terminator detection,
    as the Homebrew protocol provides explicit flags in the packet header.
 
+### Roaming Transceivers (HBlink4 extension)
+
+A roaming transceiver is a simplex radio that HBlink4 retunes for each unit call
+it routes there (RadioDesk's `roaming_txvr`, driving an OpenGD77 in hotspot
+mode). It registers with DMRC like MMDVMHost, under a pattern with
+`roaming: true`; the RX/TX frequency in its DMRC keepalive is the channel it's
+on now. Two packets are added:
+
+1. **DMRT** — tune for a stream (master → peer, 18 bytes), sent before the
+   stream's first DMRD:
+   ```
+   [0:4]   'DMRT'
+   [4:8]   peer ID
+   [8:12]  stream ID (the DMRD packets that follow carry it)
+   [12:16] frequency, Hz, big-endian (simplex: RX = TX)
+   [16]    color code
+   [17]    power, 0-255 (MMDVM RF level; 255 = the radio's own setting)
+   ```
+2. **DMRK** — the answer (peer → master, 18 bytes), once the transceiver has
+   tuned and listened before talking:
+   ```
+   [0:4]   'DMRK'
+   [4:8]   peer ID
+   [8:12]  stream ID
+   [12]    status: 0 on air, 1 channel busy, 2 channel not allowed,
+                   3 radio error, 4 transceiver busy (another call)
+   [13:17] frequency, Hz, big-endian
+   [17]    color code
+   ```
+   On anything but 0 the transceiver discards the stream; HBlink4 stops
+   forwarding it and emits `unit_call_unroutable` with the reason.
+
+DMRD for a stream with no DMRT is dropped by the transceiver.
+
 ## Connection Flow
 
 1. **Initial Connection**

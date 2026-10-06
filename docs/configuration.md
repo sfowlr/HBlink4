@@ -64,6 +64,7 @@ The `global` section contains server-wide settings that control the basic operat
 | `user_cache.timeout` | number | Seconds before user cache entries expire (default: 600, minimum: 60) |
 | `unit_call_flood` | boolean | Broadcast unit calls whose target can't be located to every unit-enabled, TX-capable peer (default: `false` — such calls are not sent) |
 | `static_subscribers` | object | `{"<radio_id>": <repeater_id>}`: always route unit calls for these radios to that peer, e.g. a dispatch console or gateway peer that owns those IDs |
+| `roaming_channels` | array | Channels a roaming transceiver may be tuned to: `[{"freq": "462.5625", "cc": 1, "power": 128}]` (`freq` in MHz or Hz; `cc` used when the radio's isn't known; `power` 0-255 MMDVM RF level, default 255 = the radio's own setting). Simplex channels only |
 | `external_last_heard` | object | Optional MQTT feed of where radios are listening, from systems outside HBlink4 (receivers that aren't peers, ARS registrations …): `{"host", "port", "username", "password", "topic": "hblink4/last_heard", "tls"}`. Message format in `hblink4/external_last_heard.py`. Needs `paho-mqtt` |
 
 **Note on IPv6**: HBlink4 is dual-stack native and will bind to both IPv4 and IPv6 by default. If your network appears to support IPv6 but connections don't establish properly (a common issue with misconfigured IPv6), set `disable_ipv6: true` to force IPv4-only mode.
@@ -74,7 +75,8 @@ The `global` section contains server-wide settings that control the basic operat
 
 1. the peer the radio was last heard on, if that peer can transmit;
 2. otherwise a TX-capable, unit-enabled peer on the same channel — its RX or TX frequency (from RPTC/DMRC) matching the frequency of the peer the radio was heard on, and the same color code when both are known. This covers radios heard by receive-only peers (pattern `tx: false`, e.g. SDR receivers), and radios reported by `external_last_heard` (the newest report wins, whether heard here or reported);
-3. otherwise the call is not sent (logged `[no route]`, dashboard event `unit_call_unroutable`), unless `unit_call_flood` is set.
+3. otherwise, when **no** fixed TX peer is on that channel (busy or not — two transmitters on one simplex frequency would collide), the channel is in `roaming_channels`, and no peer is hearing traffic on it right now: a free roaming transceiver (pattern `roaming: true`), one already on the channel first, retuned to it, on TS2. If the transceiver then hears the channel busy or can't tune, it answers so and the call is dropped (`unit_call_unroutable` with a `reason`);
+4. otherwise the call is not sent (logged `[no route]`, dashboard event `unit_call_unroutable`), unless `unit_call_flood` is set.
 
 > ⚠️ **Don't set `user_cache.timeout` shorter than your longest expected transmission.** A cache entry's `last_heard` is refreshed only at stream start (PTT), not on every voice packet, so a transmission that outlasts the timeout will leave the talker's entry expired by the time they unkey — even though they were clearly active the whole time. DMR transmissions can run 2–3 minutes, so keep the timeout well above that. The 600-second default comfortably covers normal operation; the 60-second minimum is permitted but only appropriate for testing or very short-TX environments. Setting it too low degrades unit-call routing by forcing unnecessary broadcasts immediately after long transmissions.
 
@@ -583,6 +585,7 @@ Multiple match types in a single pattern are combined with OR logic (any match t
 | `trust` | boolean | If true, repeater can use any TG (config TGs become defaults) |
 | `default_unit_calls` | boolean | Default unit (private) call participation for repeaters matching this pattern. Repeaters can override via `UNIT=true\|false` in RPTO. (default: `false`) |
 | `tx` | boolean | `false` for receive-only peers: they still update last-heard, but unit calls are never routed to them (default: `true`) |
+| `roaming` | boolean | A roaming transceiver: a simplex radio HBlink4 retunes per unit call (DMRT/DMRK, see protocol.md) to reach radios on channels in `roaming_channels` that no fixed peer transmits on. Never sent group calls. Needs `default_unit_calls: true` (default: `false`) |
 
 **Symmetric Routing:**
 The same talkgroup lists control BOTH directions:

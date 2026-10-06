@@ -26,6 +26,13 @@ import asyncio
 
 # Global configuration dictionary
 CONFIG: Dict[str, Any] = {}
+
+# Roaming transceivers (see HBProtocol._roaming_route): simplex hotspots, so TS2,
+# and the DMRK status codes.
+ROAMING_SLOT = 2
+ROAMING_ON_AIR = 0
+ROAMING_STATUS = {1: 'channel busy', 2: 'channel not allowed', 3: 'radio error', 4: 'transceiver busy'}
+
 LOGGER = logging.getLogger(__name__)
 
 import os
@@ -36,7 +43,7 @@ try:
     from .constants import (
         RPTA, RPTL, RPTK, RPTC, RPTCL, MSTCL, DMRD,
         MSTNAK, MSTPONG, RPTPING, RPTACK, RPTP, RPTO, DMRA,
-        DMRC, DMRP
+        DMRC, DMRP, DMRT, DMRK
     )
     from .access_control import RepeaterMatcher
     from .events import EventEmitter
@@ -69,7 +76,7 @@ except ImportError:
     from constants import (
         RPTA, RPTL, RPTK, RPTC, RPTCL, MSTCL, DMRD,
         MSTNAK, MSTPONG, RPTPING, RPTACK, RPTP, RPTO, DMRA,
-        DMRC, DMRP
+        DMRC, DMRP, DMRT, DMRK
     )
     from access_control import RepeaterMatcher
     from events import EventEmitter
@@ -291,6 +298,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         # later override this with an explicit UNIT=true|false entry.
         repeater.unit_calls_enabled = repeater_config.default_unit_calls
         repeater.tx_capable = repeater_config.tx
+        repeater.roaming = repeater_config.roaming
         LOGGER.debug(
             f'Repeater {rid_to_int(repeater_id)} unit calls '
             f'{"ENABLED" if repeater.unit_calls_enabled else "DISABLED"} (pattern default)'
@@ -1839,6 +1847,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 repeater_id = data[4:8]
             elif _command == DMRC:
                 repeater_id = data[4:8]
+            elif _command == DMRK:
+                repeater_id = data[4:8]
             elif _command == RPTC:
                 if data[:5] == RPTCL:
                     repeater_id = data[5:9]
@@ -1914,6 +1924,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             elif _command == DMRC:
                 LOGGER.debug(f'Received DMRC from {ip}:{port} - MMDVMHost Configuration (packet length: {len(data)})')
                 self._handle_dmrc(repeater_id, data, addr)
+            elif _command == DMRK:
+                self._handle_roaming_ack(repeater_id, data)
             else:
                 # Try to decode the command as ASCII for better logging
                 try:
@@ -2469,7 +2481,12 @@ class HBProtocol(asyncio.DatagramProtocol):
              color code, when both are known) — on the radio's last slot.
              This covers radios heard by receive-only peers (SDR receivers).
           3. an outbound link, when the radio was heard over one (source slot;
-             link slots are the far end's business).
+             link slots are the far end's business);
+          4. a roaming transceiver, retuned to the radio's channel — only when
+             no fixed TX peer is on that channel (busy or not: two
+             transmitters on one simplex frequency would collide), the
+             channel is in `global.roaming_channels`, and nothing is heard on
+             it right now. Always TS2: roamers are simplex hotspots.
         """
         if not self._user_cache:
             return None
@@ -2491,17 +2508,10 @@ class HBProtocol(asyncio.DatagramProtocol):
 
         out_slot = entry.slot if entry.slot in (1, 2) else slot
         heard_on = self._repeaters.get(entry.repeater_id.to_bytes(4, 'big')) if entry.repeater_id else None
-        if heard_on is not None and heard_on.tx_capable:
+        if heard_on is not None and heard_on.tx_capable and not heard_on.roaming:
             candidates = [heard_on]
         elif entry.freq is not None:
-            candidates = sorted(
-                (r for r in self._repeaters.values()
-                 if r.tx_capable
-                 and (freqs_match(entry.freq, parse_freq_hz(r.rx_freq))
-                      or freqs_match(entry.freq, parse_freq_hz(r.tx_freq)))
-                 and (entry.colorcode is None
-                      or parse_colorcode(r.colorcode) in (None, entry.colorcode))),
-                key=lambda r: r.repeater_id)
+            candidates = self._fixed_tx_peers(entry.freq, entry.colorcode)
         else:
             candidates = []
         for repeater in candidates:
@@ -2509,7 +2519,125 @@ class HBProtocol(asyncio.DatagramProtocol):
                 continue
             if self._unit_target_ok(repeater, out_slot, stream_id, rf_src, dst_id):
                 return (repeater.repeater_id, out_slot)
+        if candidates or entry.freq is None:
+            return None
+        return self._roaming_route(entry.freq, entry.colorcode, rf_src, dst_id, stream_id)
+
+    def _fixed_tx_peers(self, freq: int, colorcode: Optional[int]) -> List[RepeaterState]:
+        """Connected TX-capable peers (not roaming transceivers) whose RX or TX
+        frequency is `freq`, and whose color code doesn't contradict it."""
+        return sorted(
+            (r for r in self._repeaters.values()
+             if r.tx_capable and not r.roaming and r.connection_state == 'connected'
+             and (freqs_match(freq, parse_freq_hz(r.rx_freq))
+                  or freqs_match(freq, parse_freq_hz(r.tx_freq)))
+             and (colorcode is None or parse_colorcode(r.colorcode) in (None, colorcode))),
+            key=lambda r: r.repeater_id)
+
+    # ========== ROAMING TRANSCEIVERS ==========
+    #
+    # A roaming transceiver is a simplex radio (an OpenGD77 in hotspot mode,
+    # driven by RadioDesk's roaming_txvr) that registers like an MMDVMHost peer
+    # (DMRC) with a pattern that sets `roaming: true`. For each unit call routed
+    # to it HBlink4 first sends DMRT — the stream id and the channel to tune to —
+    # then the call's DMRD packets as usual. The transceiver tunes, listens
+    # before talking, and answers DMRK: on air, or why not.
+    #
+    #   DMRT  [0:4] 'DMRT'  [4:8] peer id  [8:12] stream id
+    #         [12:16] frequency, Hz (big-endian)  [16] color code
+    #         [17] power, 0-255 (MMDVM RF level; 255 = the radio's own setting)
+    #   DMRK  [0:4] 'DMRK'  [4:8] peer id  [8:12] stream id  [12] status
+    #         [13:17] frequency, Hz (big-endian)  [17] color code
+
+    def _roaming_channel(self, freq: int, colorcode: Optional[int]) -> Optional[Dict[str, int]]:
+        """The `global.roaming_channels` entry for `freq` (a roamer is only ever
+        tuned to one of these), as {'freq', 'cc', 'power'}, or None."""
+        for ch in CONFIG.get('global', {}).get('roaming_channels', []) or []:
+            ch_freq = parse_freq_hz(ch.get('freq'))
+            if not freqs_match(freq, ch_freq):
+                continue
+            ch_cc = parse_colorcode(ch.get('cc'))
+            if ch_cc is not None and colorcode is not None and ch_cc != colorcode:
+                continue
+            cc = ch_cc if ch_cc is not None else colorcode
+            if cc is None:
+                continue
+            power = ch.get('power', 255)
+            return {'freq': ch_freq, 'cc': cc,
+                    'power': max(0, min(255, int(power))) if isinstance(power, (int, float)) else 255}
         return None
+
+    def _channel_busy(self, freq: int) -> bool:
+        """Is anything being heard or sent on `freq` right now? Any peer on that
+        frequency — receive-only ones included — with a stream in progress."""
+        for r in self._repeaters.values():
+            if r.connection_state != 'connected':
+                continue
+            if not (freqs_match(freq, parse_freq_hz(r.rx_freq))
+                    or freqs_match(freq, parse_freq_hz(r.tx_freq))):
+                continue
+            for s in (1, 2):
+                stream = r.get_slot_stream(s)
+                if stream is not None and not stream.ended:
+                    return True
+        return False
+
+    def _roaming_route(self, freq: int, colorcode: Optional[int], rf_src: bytes, dst_id: bytes,
+                       stream_id: bytes) -> Optional[Tuple[bytes, int]]:
+        channel = self._roaming_channel(freq, colorcode)
+        if channel is None or self._channel_busy(channel['freq']):
+            return None
+        roamers = [
+            r for r in self._repeaters.values()
+            if r.roaming and r.tx_capable and r.unit_calls_enabled and r.connection_state == 'connected'
+            and not any(self._is_slot_busy(r.repeater_id, s, stream_id, rf_src, dst_id, is_unit_call=True)
+                        for s in (1, 2))]
+        if not roamers:
+            return None
+        # One already on the channel needn't retune.
+        roamers.sort(key=lambda r: (
+            not (freqs_match(channel['freq'], parse_freq_hz(r.tx_freq))
+                 and parse_colorcode(r.colorcode) == channel['cc']),
+            r.repeater_id))
+        roamer = roamers[0]
+        roamer.send(b''.join([DMRT, roamer.repeater_id, stream_id, channel['freq'].to_bytes(4, 'big'),
+                              bytes([channel['cc'], channel['power']])]))
+        LOGGER.info(f'Roaming transceiver {rid_to_int(roamer.repeater_id)} → '
+                    f'{channel["freq"] / 1e6:.5f} MHz CC{channel["cc"]} for stream {stream_id.hex()}')
+        return (roamer.repeater_id, ROAMING_SLOT)
+
+    def _handle_roaming_ack(self, repeater_id: bytes, data: bytes) -> None:
+        """DMRK: the roaming transceiver is on air for the stream, or isn't
+        (the call is then dropped and reported unroutable)."""
+        repeater = self._repeaters.get(repeater_id)
+        if repeater is None or not repeater.roaming or len(data) < 18:
+            return
+        stream_id, status = data[8:12], data[12]
+        freq, cc = int.from_bytes(data[13:17], 'big'), data[17]
+        rid_int = rid_to_int(repeater_id)
+        if status == ROAMING_ON_AIR:
+            repeater.rx_freq = repeater.tx_freq = str(freq).encode()
+            repeater.colorcode = str(cc).encode()
+            LOGGER.info(f'Roaming transceiver {rid_int} on air at {freq / 1e6:.5f} MHz CC{cc} '
+                        f'for stream {stream_id.hex()}')
+            self._events.emit('roaming_on_air', {'repeater_id': rid_int, 'stream_id': stream_id.hex(),
+                                                 'freq': freq, 'colorcode': cc})
+            return
+        reason = ROAMING_STATUS.get(status, f'status {status}')
+        LOGGER.warning(f'Roaming transceiver {rid_int} did not send stream {stream_id.hex()}: {reason}')
+        for owner in list(self._repeaters.values()) + list(self._outbounds.values()):
+            for s in (1, 2):
+                stream = owner.get_slot_stream(s)
+                if stream is None or stream.stream_id != stream_id:
+                    continue
+                if owner is repeater:
+                    owner.set_slot_stream(s, None)          # the roamer's assumed stream: it's free
+                elif stream.target_repeaters and repeater_id in stream.target_repeaters:
+                    stream.target_repeaters.discard(repeater_id)
+                    self._events.emit('unit_call_unroutable', {
+                        'repeater_id': rid_to_int(stream.repeater_id) if stream.repeater_id else None,
+                        'slot': s, 'src_id': bytes_to_int(stream.rf_src),
+                        'dst_id': bytes_to_int(stream.dst_id), 'reason': reason})
 
     def _calculate_unit_call_targets(self, source_repeater_id: Optional[bytes], slot: int,
                                       rf_src: bytes, dst_id: bytes, stream_id: bytes,
@@ -2563,7 +2691,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         # local repeaters (anti-loop).
         target_set: set = set()
         for target_id, target_repeater in self._repeaters.items():
-            if target_id == source_repeater_id:
+            if target_id == source_repeater_id or target_repeater.roaming:
                 continue
             if self._unit_target_ok(target_repeater, slot, stream_id, rf_src, dst_id):
                 target_set.add(target_id)
@@ -2911,6 +3039,10 @@ class HBProtocol(asyncio.DatagramProtocol):
                                 f'{repeater.ip}:{repeater.port} → {ip}:{port}')
                     repeater.ip, repeater.port = ip, port
                     self._init_repeater_send(repeater, addr)
+                if repeater.roaming and len(data) >= 119:
+                    # A roaming transceiver's keepalive says where it's tuned now.
+                    repeater.rx_freq, repeater.tx_freq = data[16:25], data[25:34]
+                    repeater.colorcode = data[36:38]
                 repeater.last_ping = time()
                 if repeater.missed_pings > 0:
                     repeater.missed_pings = 0
@@ -3585,6 +3717,10 @@ class HBProtocol(asyncio.DatagramProtocol):
 
             # Only forward to connected repeaters
             if target_repeater.connection_state != 'connected':
+                continue
+
+            # Roaming transceivers carry unit calls only
+            if target_repeater.roaming:
                 continue
 
             # Check outbound routing (TG allowed on this repeater/slot, network vocab)

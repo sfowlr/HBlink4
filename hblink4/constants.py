@@ -21,6 +21,8 @@ RPTO    = b'RPTO'     # Repeater sending Options
 DMRA    = b'DMRA'     # DMR Talker Alias
 DMRC    = b'DMRC'     # DMR Configuration (MMDVMHost protocol variant, no-auth)
 DMRP    = b'DMRP'     # DMR Pong (MMDVMHost keepalive response)
+DMRT    = b'DMRT'     # Tune a roaming transceiver for a stream (master → peer)
+DMRK    = b'DMRK'     # Roaming transceiver's answer to DMRT (peer → master)
 
 # Protocol Configuration
 DMR_DATA_PACKET_LENGTH = 55  # Minimum length of valid DMR data packet

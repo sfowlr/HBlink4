@@ -280,6 +280,11 @@ class RepeaterState:
     # the matched pattern's `tx`.
     tx_capable: bool = True
 
+    # A roaming transceiver (pattern `roaming`): retuned per unit call with
+    # DMRT, answered with DMRK. Its rx_freq/tx_freq/colorcode follow the
+    # channel it last confirmed (DMRK or its DMRC keepalive).
+    roaming: bool = False
+
     # DMRD translation maps (inverses of each other; empty = no translation).
     # inbound_map:  local (slot,tgid) → network (slot,tgid) — applied when this
     #               repeater SENDS us traffic, converting its local addressing

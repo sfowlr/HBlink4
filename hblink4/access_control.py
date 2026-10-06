@@ -72,6 +72,10 @@ class RepeaterConfig:
     # False for receive-only peers: they feed last-heard, but unit calls are
     # never routed to them.
     tx: bool = True
+    # A roaming transceiver: one simplex radio HBlink4 retunes per call (DMRT)
+    # to reach radios on channels no fixed peer transmits on. Never gets group
+    # traffic; used for a unit call only when no fixed TX peer is on the channel.
+    roaming: bool = False
 
 @dataclass
 class PatternMatch:
