@@ -69,6 +69,9 @@ class RepeaterConfig:
     # Per-pattern default for unit (private) call participation. Repeaters can
     # override via UNIT=true|false in RPTO. Absent UNIT in RPTO = use this.
     default_unit_calls: bool = False
+    # False for receive-only peers: they feed last-heard, but unit calls are
+    # never routed to them.
+    tx: bool = True
 
 @dataclass
 class PatternMatch:

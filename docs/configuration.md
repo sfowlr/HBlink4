@@ -62,10 +62,19 @@ The `global` section contains server-wide settings that control the basic operat
 | `stream_timeout` | float | Fallback timeout when terminator frame is lost (default: 2.0 seconds) |
 | `stream_hang_time` | float | Seconds to reserve slot for same source after stream ends (default: 10.0-20.0 seconds) |
 | `user_cache.timeout` | number | Seconds before user cache entries expire (default: 600, minimum: 60) |
+| `unit_call_flood` | boolean | Broadcast unit calls whose target can't be located to every unit-enabled, TX-capable peer (default: `false` — such calls are not sent) |
+| `static_subscribers` | object | `{"<radio_id>": <repeater_id>}`: always route unit calls for these radios to that peer, e.g. a dispatch console or gateway peer that owns those IDs |
+| `external_last_heard` | object | Optional MQTT feed of where radios are listening, from systems outside HBlink4 (receivers that aren't peers, ARS registrations …): `{"host", "port", "username", "password", "topic": "hblink4/last_heard", "tls"}`. Message format in `hblink4/external_last_heard.py`. Needs `paho-mqtt` |
 
 **Note on IPv6**: HBlink4 is dual-stack native and will bind to both IPv4 and IPv6 by default. If your network appears to support IPv6 but connections don't establish properly (a common issue with misconfigured IPv6), set `disable_ipv6: true` to force IPv4-only mode.
 
 **User Cache**: The user cache tracks the last known repeater for each DMR ID to enable efficient private call routing. Entries are automatically cleaned up every 60 seconds. The timeout must be at least 60 seconds.
+
+**Unit call routing**: a unit (private) call goes only to where its target radio is listening, on the target's last-heard slot (not the caller's):
+
+1. the peer the radio was last heard on, if that peer can transmit;
+2. otherwise a TX-capable, unit-enabled peer on the same channel — its RX or TX frequency (from RPTC/DMRC) matching the frequency of the peer the radio was heard on, and the same color code when both are known. This covers radios heard by receive-only peers (pattern `tx: false`, e.g. SDR receivers), and radios reported by `external_last_heard` (the newest report wins, whether heard here or reported);
+3. otherwise the call is not sent (logged `[no route]`, dashboard event `unit_call_unroutable`), unless `unit_call_flood` is set.
 
 > ⚠️ **Don't set `user_cache.timeout` shorter than your longest expected transmission.** A cache entry's `last_heard` is refreshed only at stream start (PTT), not on every voice packet, so a transmission that outlasts the timeout will leave the talker's entry expired by the time they unkey — even though they were clearly active the whole time. DMR transmissions can run 2–3 minutes, so keep the timeout well above that. The 600-second default comfortably covers normal operation; the 60-second minimum is permitted but only appropriate for testing or very short-TX environments. Setting it too low degrades unit-call routing by forcing unnecessary broadcasts immediately after long transmissions.
 
@@ -573,6 +582,7 @@ Multiple match types in a single pattern are combined with OR logic (any match t
 | `slot2_talkgroups` | array | List of allowed talkgroup IDs for timeslot 2 (bidirectional) |
 | `trust` | boolean | If true, repeater can use any TG (config TGs become defaults) |
 | `default_unit_calls` | boolean | Default unit (private) call participation for repeaters matching this pattern. Repeaters can override via `UNIT=true\|false` in RPTO. (default: `false`) |
+| `tx` | boolean | `false` for receive-only peers: they still update last-heard, but unit calls are never routed to them (default: `true`) |
 
 **Symmetric Routing:**
 The same talkgroup lists control BOTH directions:

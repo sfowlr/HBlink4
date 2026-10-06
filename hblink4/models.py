@@ -105,6 +105,9 @@ class StreamState:
     # responds (Phase 3).
     is_unit_call: bool = False
     is_broadcast_unit_call: bool = False
+    # Unit calls: outgoing slot per local target, when it differs from the
+    # source's (the target radio's last-heard slot). Absent = source slot.
+    target_slots: Optional[Dict[Any, int]] = None
 
     # DMR Link Control for outbound rewrites under translation.
     #
@@ -270,6 +273,12 @@ class RepeaterState:
     # from the matched pattern's `default_unit_calls` when the repeater connects,
     # and overridden by a `UNIT=true|false` entry in RPTO if present.
     unit_calls_enabled: bool = False
+
+    # Whether this peer can transmit. Receive-only peers (e.g. SDR receivers)
+    # still feed the user cache, but unit calls are never routed to them; the
+    # router picks a TX-capable peer on the same frequency instead. Seeded from
+    # the matched pattern's `tx`.
+    tx_capable: bool = True
 
     # DMRD translation maps (inverses of each other; empty = no translation).
     # inbound_map:  local (slot,tgid) → network (slot,tgid) — applied when this

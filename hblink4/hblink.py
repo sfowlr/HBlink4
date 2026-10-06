@@ -41,10 +41,11 @@ try:
     from .access_control import RepeaterMatcher
     from .events import EventEmitter
     from .user_cache import UserCache
+    from .external_last_heard import ExternalLastHeard
     from .utils import (
         safe_decode_bytes, normalize_addr, rid_to_int, bytes_to_int,
         cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type,
-        fmt_ts_tg
+        fmt_ts_tg, parse_freq_hz, parse_colorcode, freqs_match
     )
     from .config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from .protocol import (
@@ -73,10 +74,11 @@ except ImportError:
     from access_control import RepeaterMatcher
     from events import EventEmitter
     from user_cache import UserCache
+    from external_last_heard import ExternalLastHeard
     from utils import (
         safe_decode_bytes, normalize_addr, rid_to_int, bytes_to_int,
         cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type,
-        fmt_ts_tg
+        fmt_ts_tg, parse_freq_hz, parse_colorcode, freqs_match
     )
     from config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from protocol import (
@@ -174,6 +176,11 @@ class HBProtocol(asyncio.DatagramProtocol):
             cache_timeout = 60
         self._user_cache = UserCache(timeout_seconds=cache_timeout)
         LOGGER.info(f'User cache initialized with {cache_timeout}s timeout')
+        # Radios always routed to one peer, e.g. a dispatch console or gateway
+        # peer that owns those IDs: {"<radio_id>": <repeater_id>}.
+        for radio_id, repeater_id in CONFIG.get('global', {}).get('static_subscribers', {}).items():
+            self._user_cache.pin(int(radio_id), int(repeater_id))
+        self._external_last_heard = None
         
         # No conversion caching - simple int.from_bytes() is fast enough
         # and avoids unbounded cache growth (memory leak prevention)
@@ -283,6 +290,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Seed unit-call participation from the pattern default. RPTO may
         # later override this with an explicit UNIT=true|false entry.
         repeater.unit_calls_enabled = repeater_config.default_unit_calls
+        repeater.tx_capable = repeater_config.tx
         LOGGER.debug(
             f'Repeater {rid_to_int(repeater_id)} unit calls '
             f'{"ENABLED" if repeater.unit_calls_enabled else "DISABLED"} (pattern default)'
@@ -1008,7 +1016,7 @@ class HBProtocol(asyncio.DatagramProtocol):
 
             # Figure out forwarding targets BEFORE creating the stream so we
             # can log target count alongside stream-start.
-            target_repeaters, is_broadcast = self._calculate_unit_call_targets(
+            target_repeaters, is_broadcast, target_slots = self._calculate_unit_call_targets(
                 source_repeater_id=None, slot=_slot,
                 rf_src=_rf_src, dst_id=_dst_id, stream_id=_stream_id,
                 source_outbound_name=conn_name,
@@ -1029,6 +1037,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 is_unit_call=True,
                 is_broadcast_unit_call=is_broadcast,
                 target_repeaters=target_repeaters,
+                target_slots=target_slots or None,
                 routing_cached=True,
             )
             outbound_state.set_slot_stream(_slot, new_stream)
@@ -1088,10 +1097,17 @@ class HBProtocol(asyncio.DatagramProtocol):
             target_repeater = self._repeaters.get(target_repeater_id)
             if not target_repeater:
                 continue
-            # No translation for unit calls — just forward the packet.
-            target_repeater.send(data)
+            # No translation for unit calls — just forward the packet, on the
+            # target radio's slot.
+            out_slot = (source_stream.target_slots or {}).get(target_repeater_id, _slot)
+            if out_slot == _slot:
+                target_repeater.send(data)
+            else:
+                buf = bytearray(data)
+                buf[15] = (buf[15] | 0x80) if out_slot == 2 else (buf[15] & 0x7F)
+                target_repeater.send(bytes(buf))
             self._update_assumed_stream(
-                target_repeater, _slot, _rf_src, _dst_id, _stream_id,
+                target_repeater, out_slot, _rf_src, _dst_id, _stream_id,
                 is_terminator, remote_repeater_id,
                 is_unit_call=True,
             )
@@ -1110,6 +1126,10 @@ class HBProtocol(asyncio.DatagramProtocol):
     def cleanup(self) -> None:
         """Send disconnect messages to all repeaters and cleanup resources."""
         LOGGER.info("Starting graceful shutdown...")
+
+        if self._external_last_heard is not None:
+            self._external_last_heard.loop_stop()
+            self._external_last_heard = None
         
         # Send disconnect to all connected repeaters
         for repeater_id, repeater in self._repeaters.items():
@@ -1203,6 +1223,14 @@ class HBProtocol(asyncio.DatagramProtocol):
             asyncio.create_task(self._run_periodic(60, self._cleanup_user_cache, "user cache cleanup"))
         )
         LOGGER.info('Periodic tasks started (repeater timeout, stream timeout, user cache cleanup)')
+
+        ext_cfg = CONFIG.get('global', {}).get('external_last_heard')
+        if ext_cfg and self._external_last_heard is None:
+            try:
+                feed = ExternalLastHeard(self._user_cache, ext_cfg.get('topic', 'hblink4/last_heard'))
+                self._external_last_heard = feed.start(asyncio.get_running_loop(), ext_cfg)
+            except Exception as e:
+                LOGGER.error(f'External last-heard feed not started: {e}')
         
 
 
@@ -2005,6 +2033,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 slot=slot,
                 talkgroup=dst_int,
                 outbound_name=cache_outbound_name,
+                source='data',
+                **self._peer_channel(cache_repeater_id),
             )
 
         return new_stream
@@ -2246,7 +2276,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 repeater_id=repeater_id,
                 callsign='',  # Callsign lookup handled by dashboard
                 slot=slot,
-                talkgroup=dst
+                talkgroup=dst,
+                **self._peer_channel(repeater_id),
             )
 
         return True
@@ -2334,7 +2365,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 return False
 
         # Calculate forwarding targets.
-        target_repeaters, is_broadcast = self._calculate_unit_call_targets(
+        target_repeaters, is_broadcast, target_slots = self._calculate_unit_call_targets(
             repeater.repeater_id, slot, rf_src, dst_id, stream_id
         )
 
@@ -2352,6 +2383,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             routing_cached=True,
             is_unit_call=True,
             is_broadcast_unit_call=is_broadcast,
+            target_slots=target_slots or None,
         )
         repeater.set_slot_stream(slot, new_stream)
 
@@ -2364,14 +2396,13 @@ class HBProtocol(asyncio.DatagramProtocol):
         elif target_repeaters:
             target_id = next(iter(target_repeaters))
             target_int = int.from_bytes(target_id, 'big') if isinstance(target_id, bytes) else target_id
-            cross_slot = ''
-            if self._user_cache:
-                entry = self._user_cache.lookup(dst_int)
-                if entry and entry.slot != slot:
-                    cross_slot = ', cross-slot'
+            cross_slot = f', TS{target_slots[target_id]}' if target_id in target_slots else ''
             mode_tag = f'[one-to-one via {target_int}{cross_slot}]'
         else:
-            mode_tag = '[no eligible targets]'
+            mode_tag = '[no route]'
+            self._events.emit('unit_call_unroutable', {
+                'repeater_id': rid_int, 'slot': slot, 'src_id': src_int, 'dst_id': dst_int,
+            })
 
         LOGGER.info(
             f'Unit RX stream started on repeater {rid_int} TS/RID: {slot}/{dst_int} '
@@ -2401,25 +2432,101 @@ class HBProtocol(asyncio.DatagramProtocol):
                 callsign='',
                 slot=slot,
                 talkgroup=dst_int,
+                **self._peer_channel(rid_int),
             )
 
         return True
 
+    def _peer_channel(self, repeater_id: int) -> Dict[str, Optional[int]]:
+        """The frequency (Hz, from RPTC/DMRC RX freq) and color code a local
+        peer reported, as user-cache kwargs. Empty values for unknown peers."""
+        repeater = self._repeaters.get(repeater_id.to_bytes(4, 'big')) if repeater_id else None
+        if repeater is None:
+            return {'freq': None, 'colorcode': None}
+        return {'freq': parse_freq_hz(repeater.rx_freq), 'colorcode': parse_colorcode(repeater.colorcode)}
+
+    def _unit_target_ok(self, repeater: RepeaterState, slot: int, stream_id: bytes,
+                        rf_src: bytes, dst_id: bytes) -> bool:
+        return (repeater.connection_state == 'connected'
+                and repeater.unit_calls_enabled
+                and repeater.tx_capable
+                and not self._is_slot_busy(repeater.repeater_id, slot, stream_id,
+                                           rf_src, dst_id, is_unit_call=True))
+
+    def _resolve_unit_route(self, dst_int: int, source_repeater_id: Optional[bytes], slot: int,
+                            rf_src: bytes, dst_id: bytes, stream_id: bytes,
+                            from_outbound: bool) -> Optional[Tuple[Any, int]]:
+        """
+        Where to send a unit call so only the target radio hears it:
+        (target, outgoing slot), or None when there's no such place.
+
+        The target is where the user cache last placed the radio (heard here,
+        or reported over `external_last_heard`, e.g. from receivers that
+        aren't peers or from ARS registrations):
+          1. that peer, if it can transmit, on the radio's last slot;
+          2. else a TX-capable peer on the same channel — its RX or TX
+             frequency equal to the one the radio was heard on (and the same
+             color code, when both are known) — on the radio's last slot.
+             This covers radios heard by receive-only peers (SDR receivers).
+          3. an outbound link, when the radio was heard over one (source slot;
+             link slots are the far end's business).
+        """
+        if not self._user_cache:
+            return None
+        entry = self._user_cache.lookup(dst_int)
+        if entry is None:
+            return None
+
+        if entry.outbound_name is not None:
+            if from_outbound:
+                return None     # anti-loop: never outbound → outbound
+            outbound = self._outbounds.get(entry.outbound_name)
+            if (outbound is not None
+                    and outbound.authenticated
+                    and outbound.config.unit_calls_enabled
+                    and not self._is_outbound_slot_busy(outbound, slot, stream_id,
+                                                        rf_src, dst_id, is_unit_call=True)):
+                return (('outbound', entry.outbound_name), slot)
+            return None
+
+        out_slot = entry.slot if entry.slot in (1, 2) else slot
+        heard_on = self._repeaters.get(entry.repeater_id.to_bytes(4, 'big')) if entry.repeater_id else None
+        if heard_on is not None and heard_on.tx_capable:
+            candidates = [heard_on]
+        elif entry.freq is not None:
+            candidates = sorted(
+                (r for r in self._repeaters.values()
+                 if r.tx_capable
+                 and (freqs_match(entry.freq, parse_freq_hz(r.rx_freq))
+                      or freqs_match(entry.freq, parse_freq_hz(r.tx_freq)))
+                 and (entry.colorcode is None
+                      or parse_colorcode(r.colorcode) in (None, entry.colorcode))),
+                key=lambda r: r.repeater_id)
+        else:
+            candidates = []
+        for repeater in candidates:
+            if repeater.repeater_id == source_repeater_id:
+                continue
+            if self._unit_target_ok(repeater, out_slot, stream_id, rf_src, dst_id):
+                return (repeater.repeater_id, out_slot)
+        return None
+
     def _calculate_unit_call_targets(self, source_repeater_id: Optional[bytes], slot: int,
                                       rf_src: bytes, dst_id: bytes, stream_id: bytes,
-                                      source_outbound_name: Optional[str] = None) -> Tuple[set, bool]:
+                                      source_outbound_name: Optional[str] = None
+                                      ) -> Tuple[set, bool, Dict[Any, int]]:
         """
         Build the target set for a unit call.
 
-        Cache hit and cached endpoint eligible → one-to-one target set
-        containing a single element: a `repeater_id` (bytes) for local
-        repeaters or `('outbound', name)` for outbound connections.
-        Cache miss (or cached endpoint ineligible) → broadcast to every
-        unit-enabled, connected endpoint (local repeaters + outbound links)
-        with the originating slot free, excluding the source endpoint.
+        Routed (see `_resolve_unit_route`) → one-to-one target set containing
+        a single element: a `repeater_id` (bytes) for local repeaters or
+        `('outbound', name)` for outbound connections, sent on the target
+        radio's last-heard slot.
 
-        Slot model is ships-in-the-night: we always forward on the source's
-        originating slot; the target's last-heard slot is informational only.
+        Not routable → nothing is sent, unless `global.unit_call_flood` is
+        set: then broadcast to every unit-enabled, TX-capable, connected
+        endpoint (local repeaters + outbound links) with the originating slot
+        free, excluding the source endpoint, on the originating slot.
 
         Anti-loop: unit calls that arrived from an outbound connection are
         never re-forwarded to any outbound (including the source) — each
@@ -2435,38 +2542,20 @@ class HBProtocol(asyncio.DatagramProtocol):
                 must be set.
 
         Returns:
-            (target_set, is_broadcast)
+            (target_set, is_broadcast, target_slots) — target_slots maps a
+            local target to its outgoing slot where that isn't `slot`.
         """
         dst_int = bytes_to_int(dst_id)
         from_outbound = source_outbound_name is not None
 
-        # Cache hit path
-        if self._user_cache:
-            source = self._user_cache.get_source_for_user(dst_int)
-            if source is not None:
-                kind, ident = source
-                if kind == 'local':
-                    cached_repeater_id = ident.to_bytes(4, 'big')
-                    if cached_repeater_id != source_repeater_id:
-                        target_repeater = self._repeaters.get(cached_repeater_id)
-                        if (target_repeater
-                                and target_repeater.connection_state == 'connected'
-                                and target_repeater.unit_calls_enabled
-                                and not self._is_slot_busy(cached_repeater_id, slot, stream_id,
-                                                           rf_src, dst_id, is_unit_call=True)):
-                            return ({cached_repeater_id}, False)
-                elif kind == 'outbound' and not from_outbound:
-                    # Local sources may route to a cached outbound target;
-                    # outbound sources never forward to another outbound.
-                    outbound = self._outbounds.get(ident)
-                    if (outbound is not None
-                            and outbound.authenticated
-                            and outbound.config.unit_calls_enabled
-                            and not self._is_outbound_slot_busy(outbound, slot, stream_id,
-                                                                rf_src, dst_id, is_unit_call=True)):
-                        return ({('outbound', ident)}, False)
-                # Cache hit but target ineligible (or cross-outbound forwarding
-                # suppressed) — fall through to broadcast.
+        route = self._resolve_unit_route(dst_int, source_repeater_id, slot, rf_src, dst_id,
+                                         stream_id, from_outbound)
+        if route is not None:
+            target, out_slot = route
+            return ({target}, False, {target: out_slot} if out_slot != slot else {})
+
+        if not CONFIG.get('global', {}).get('unit_call_flood', False):
+            return (set(), False, {})
 
         # Broadcast path: every unit-enabled local repeater except source,
         # plus every unit-enabled outbound except source when call originated
@@ -2476,13 +2565,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         for target_id, target_repeater in self._repeaters.items():
             if target_id == source_repeater_id:
                 continue
-            if target_repeater.connection_state != 'connected':
-                continue
-            if not target_repeater.unit_calls_enabled:
-                continue
-            if self._is_slot_busy(target_id, slot, stream_id, rf_src, dst_id, is_unit_call=True):
-                continue
-            target_set.add(target_id)
+            if self._unit_target_ok(target_repeater, slot, stream_id, rf_src, dst_id):
+                target_set.add(target_id)
 
         if not from_outbound:
             for conn_name, outbound in self._outbounds.items():
@@ -2495,7 +2579,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                     continue
                 target_set.add(('outbound', conn_name))
 
-        return (target_set, True)
+        return (target_set, True, {})
 
     def _is_outbound_slot_busy(self, outbound: 'OutboundState', slot: int, stream_id: bytes,
                                 rf_src: bytes, dst_id: bytes,
@@ -2818,7 +2902,15 @@ class HBProtocol(asyncio.DatagramProtocol):
             repeater = self._repeaters.get(repeater_id)
 
             if repeater and repeater.connection_state == 'connected':
-                # Already registered — treat as keepalive, update ping time
+                # Already registered — treat as keepalive, update ping time.
+                # DMRC has no login, so a peer that restarted (new source port)
+                # simply carries on from its new address; follow it, or we'd keep
+                # sending to the dead one until the old registration times out.
+                if not self._addr_matches_repeater(repeater, addr):
+                    LOGGER.info(f'DMRC peer {rid_to_int(repeater_id)} moved '
+                                f'{repeater.ip}:{repeater.port} → {ip}:{port}')
+                    repeater.ip, repeater.port = ip, port
+                    self._init_repeater_send(repeater, addr)
                 repeater.last_ping = time()
                 if repeater.missed_pings > 0:
                     repeater.missed_pings = 0
@@ -3751,15 +3843,20 @@ class HBProtocol(asyncio.DatagramProtocol):
                 if not target_repeater:
                     continue  # Repeater disconnected mid-stream
 
+                # Unit calls go out on the target radio's slot.
+                base_slot = net_slot
+                if source_stream.target_slots:
+                    base_slot = source_stream.target_slots.get(target_repeater_id, net_slot)
+
                 # Per-target translation: network → target-local (if mapped).
                 if target_repeater.outbound_map:
-                    t_local = target_repeater.outbound_map.get((net_slot, net_dst_id))
+                    t_local = target_repeater.outbound_map.get((base_slot, net_dst_id))
                     if t_local is not None:
                         out_slot, out_dst = t_local
                     else:
-                        out_slot, out_dst = net_slot, net_dst_id
+                        out_slot, out_dst = base_slot, net_dst_id
                 else:
-                    out_slot, out_dst = net_slot, net_dst_id
+                    out_slot, out_dst = base_slot, net_dst_id
 
                 # Fast path: no source translation, no target translation, no
                 # LC rewrite needed — ship the original buffer as-is.
@@ -4294,7 +4391,9 @@ def main():
     load_config(sys.argv[1])
     # Setup logging using the imported function
     global LOGGER
-    LOGGER = setup_logging(CONFIG, __name__)
+    # Handlers on the package logger, so every module's logger (user_cache,
+    # sctp, external_last_heard …) reaches the console and log file too.
+    LOGGER = setup_logging(CONFIG, __name__.split('.')[0])
     
     # Deferred import — __version__ is bound on the package module after
     # __init__.py finishes, which is after hblink.py finishes loading.

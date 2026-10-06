@@ -40,6 +40,14 @@ class UserEntry:
     last_heard: float = field(default_factory=time)
     talker_alias: Optional[str] = None
     outbound_name: Optional[str] = None
+    # Where the radio is listening, for routing unit calls to a TX-capable peer
+    # on the same channel when it was heard on a receive-only one: the heard-on
+    # peer's frequency (Hz) and color code, when known. `source` says what the
+    # entry came from: 'voice' / 'data' (heard by a peer here), 'voice-ext' /
+    # 'ars-ext' (reported by an external system), or 'static' (pinned).
+    freq: Optional[int] = None
+    colorcode: Optional[int] = None
+    source: str = 'voice'
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization"""
@@ -52,6 +60,9 @@ class UserEntry:
             'last_heard': self.last_heard,
             'talker_alias': self.talker_alias,
             'outbound_name': self.outbound_name,
+            'freq': self.freq,
+            'colorcode': self.colorcode,
+            'source': self.source,
         }
 
 
@@ -75,12 +86,15 @@ class UserCache:
             timeout_seconds: How long to keep entries (default 600 = 10 minutes)
         """
         self._cache: Dict[int, UserEntry] = {}
+        self._static: Dict[int, UserEntry] = {}
         self._timeout = timeout_seconds
         LOGGER.info(f'User cache initialized with {timeout_seconds}s timeout')
     
     def update(self, radio_id: int, repeater_id: int, callsign: str,
                slot: int, talkgroup: int, talker_alias: Optional[str] = None,
-               outbound_name: Optional[str] = None) -> None:
+               outbound_name: Optional[str] = None, freq: Optional[int] = None,
+               colorcode: Optional[int] = None, source: str = 'voice',
+               heard_at: Optional[float] = None) -> bool:
         """
         Update cache with user activity.
 
@@ -95,19 +109,32 @@ class UserCache:
                 via an outbound server link rather than a local repeater.
                 When set, routing decisions will forward unit calls via that
                 outbound instead of to any local repeater.
+            freq: Frequency (Hz) of the peer the user was heard on, if known
+            colorcode: Color code of that peer, if known
+            source: What reported it (see UserEntry.source)
+            heard_at: When it was heard, for reports from elsewhere; an entry
+                already newer than this is kept. Defaults to now.
+
+        Returns:
+            False if the update was ignored as older than the cached entry.
         """
-        now = time()
+        now = time() if heard_at is None else heard_at
         source_desc = f'outbound "{outbound_name}"' if outbound_name else f'repeater {repeater_id}'
 
         # Update or create entry
         if radio_id in self._cache:
             entry = self._cache[radio_id]
+            if heard_at is not None and entry.last_heard > heard_at:
+                return False
             entry.repeater_id = repeater_id
             entry.outbound_name = outbound_name
             entry.callsign = callsign
             entry.slot = slot
             entry.talkgroup = talkgroup
             entry.last_heard = now
+            entry.freq = freq
+            entry.colorcode = colorcode
+            entry.source = source
             if talker_alias:
                 entry.talker_alias = talker_alias
             LOGGER.debug(f'Updated cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
@@ -121,8 +148,20 @@ class UserCache:
                 last_heard=now,
                 talker_alias=talker_alias,
                 outbound_name=outbound_name,
+                freq=freq,
+                colorcode=colorcode,
+                source=source,
             )
             LOGGER.debug(f'Added to cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
+        return True
+
+    def pin(self, radio_id: int, repeater_id: int) -> None:
+        """Always route `radio_id` to local `repeater_id` (e.g. a dispatch
+        console or gateway peer that owns that ID). Pinned entries never expire and take
+        precedence over heard activity. Slot 0 = use the caller's slot."""
+        self._static[radio_id] = UserEntry(radio_id=radio_id, repeater_id=repeater_id, callsign='',
+                                           slot=0, talkgroup=0, source='static')
+        LOGGER.info(f'Pinned user {radio_id} to repeater {repeater_id}')
     
     def lookup(self, radio_id: int) -> Optional[UserEntry]:
         """
@@ -134,6 +173,10 @@ class UserCache:
         Returns:
             UserEntry if found and not expired, None otherwise
         """
+        pinned = self._static.get(radio_id)
+        if pinned is not None:
+            pinned.last_heard = time()
+            return pinned
         if radio_id not in self._cache:
             return None
         

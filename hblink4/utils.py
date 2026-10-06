@@ -8,7 +8,7 @@ can be used throughout the codebase.
 import logging
 import logging.handlers
 import pathlib
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 # Type definitions for reusability
 PeerAddress = Union[Tuple[str, int], Tuple[str, int, int, int]]
@@ -280,3 +280,36 @@ def setup_logging(config: dict, logger_name: str = __name__) -> logging.Logger:
         logger.addHandler(console_handler)
     
     return logger
+
+# Two frequencies within this many Hz are the same channel (DMR channels are
+# 12.5 kHz apart; external reports may give MHz rounded to a few decimals).
+FREQ_MATCH_TOLERANCE_HZ = 1250
+
+
+def parse_freq_hz(value) -> Optional[int]:
+    """A frequency as HBP config packets write it (ASCII Hz, e.g. b'461687500'),
+    or in MHz (e.g. '461.68750' or 461.6875) → Hz, or None."""
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode('ascii', 'ignore')
+    try:
+        f = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if f <= 0:
+        return None
+    return int(round(f * 1e6)) if f < 10_000 else int(round(f))
+
+
+def parse_colorcode(value) -> Optional[int]:
+    """Color code from a config packet / record → 0..15, or None."""
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode('ascii', 'ignore')
+    try:
+        cc = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return cc if 0 <= cc <= 15 else None
+
+
+def freqs_match(a: Optional[int], b: Optional[int]) -> bool:
+    return a is not None and b is not None and abs(a - b) <= FREQ_MATCH_TOLERANCE_HZ
