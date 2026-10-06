@@ -1308,6 +1308,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             reason_text = f'reason=terminator - entering hang time ({hang_time}s)'
         elif end_reason == 'fast_terminator':
             reason_text = f'reason=fast_terminator - entering hang time ({hang_time}s)'
+        elif end_reason == 'data_complete':
+            reason_text = f'reason=data_complete - entering hang time ({hang_time}s)'
         else:  # timeout
             reason_text = f'reason=timeout - entering hang time ({hang_time}s)'
         
@@ -1961,12 +1963,14 @@ class HBProtocol(asyncio.DatagramProtocol):
                             frame_type: int, dtype_vseq: int,
                             payload: bytes,
                             cache_repeater_id: int = 0,
-                            cache_outbound_name: Optional[str] = None) -> StreamState:
+                            cache_outbound_name: Optional[str] = None,
+                            source_repeater: Optional[RepeaterState] = None) -> StreamState:
         """
         Track a data call: log it, optionally decode the data header, emit a
-        dashboard event — but DO NOT forward. Same path for group and unit
-        data; the only forwarding-relevant distinction is that `dst_id` is
-        a TGID for group data and a target RID for unit data.
+        dashboard event. Group data is never forwarded. Unit data from a local
+        repeater (`source_repeater`) is routed like a unit voice call when
+        `global.forward_unit_data` is set and the source is unit-enabled;
+        otherwise it isn't forwarded either.
 
         Returns a StreamState marked with call_type="data". Caller must
         install it on the owning repeater/outbound slot so subsequent
@@ -1998,6 +2002,20 @@ class HBProtocol(asyncio.DatagramProtocol):
         if frame_type == 2 and dtype_vseq == 6 and len(payload) >= 33:
             decoded = decode_data_header(payload[:33])
 
+        targets: set = set()
+        target_slots: Dict[Any, int] = {}
+        routed = (not is_group and source_repeater is not None
+                  and source_repeater.unit_calls_enabled
+                  and CONFIG.get('global', {}).get('forward_unit_data', False))
+        if routed:
+            targets, _, target_slots = self._calculate_unit_call_targets(
+                owner_id, slot, rf_src, dst_id, stream_id)
+            if not targets:
+                self._events.emit('unit_call_unroutable', {
+                    'repeater_id': cache_repeater_id, 'slot': slot, 'src_id': src_int,
+                    'dst_id': dst_int, 'is_data': True,
+                })
+
         if emit_log:
             self._data_log_recent[dedupe_key] = current_time
             dname = dtype_name(dtype_vseq) if frame_type == 2 else f'voice-ft{frame_type}'
@@ -2014,7 +2032,15 @@ class HBProtocol(asyncio.DatagramProtocol):
                 parts.append(f'raw={decoded["raw"].hex()}')
             else:
                 parts.append(f'payload={payload[:16].hex()}')
-            parts.append('[not forwarded]')
+            if not routed:
+                parts.append('[not forwarded]')
+            elif targets:
+                target = next(iter(targets))
+                target_label = rid_to_int(target) if isinstance(target, bytes) else target[1]
+                cross_slot = f', TS{target_slots[target]}' if target in target_slots else ''
+                parts.append(f'[one-to-one via {target_label}{cross_slot}]')
+            else:
+                parts.append('[no route]')
             LOGGER.info(' '.join(parts))
 
         new_stream = StreamState(
@@ -2028,8 +2054,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             packet_count=1,
             call_type="data",
             is_unit_call=(not is_group),
-            # Data calls do not fan out, so nothing to cache.
-            target_repeaters=set(),
+            target_repeaters=targets,
+            target_slots=target_slots or None,
             routing_cached=True,
         )
 
@@ -2061,8 +2087,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         """
         # Voice-vs-data branch: the HBP call_type bit is only group-vs-unit,
         # so check the payload frame_type/dtype_vseq to tell data bursts
-        # (APRS, SMS, GPS, CSBK) from real voice. Data calls are logged but
-        # never forwarded.
+        # (APRS, SMS, GPS, CSBK) from real voice. Data calls are logged; unit
+        # data is forwarded when `forward_unit_data` is set.
         if classify_stream_kind(frame_type, dtype_vseq) == STREAM_KIND_DATA:
             rid_int = rid_to_int(repeater.repeater_id)
             new_stream = self._handle_data_stream(
@@ -2074,6 +2100,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 payload=payload,
                 cache_repeater_id=rid_int,
                 cache_outbound_name=None,
+                source_repeater=repeater,
             )
             repeater.set_slot_stream(slot, new_stream)
             emit_call_type = 'private' if call_type_bit == 1 else 'group'
@@ -2797,6 +2824,15 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # fresh stream_ids; suppress contention warning for those and
                 # silently accept (logged at stream-start dedupe window).
                 if current_stream.call_type == 'data':
+                    # MMDVMHost gives every CSBK (preambles) and the data
+                    # header its own stream id: the same radio continuing
+                    # its data transaction is the same stream.
+                    if (current_stream.rf_src == rf_src and current_stream.dst_id == dst_id
+                            and classify_stream_kind(frame_type, dtype_vseq) == STREAM_KIND_DATA):
+                        current_stream.stream_id = stream_id
+                        current_stream.last_seen = current_time
+                        current_stream.packet_count += 1
+                        return True
                     return False
                 LOGGER.warning(f'Stream contention on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
                               f'existing stream (src={int.from_bytes(current_stream.rf_src, "big")}, '
@@ -3794,7 +3830,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         return target_set
     
     def _forward_stream(self, data: bytes, source_repeater_id: bytes, slot: int,
-                       rf_src: bytes, dst_id: bytes, stream_id: bytes) -> None:
+                       rf_src: bytes, dst_id: bytes, stream_id: bytes,
+                       end_of_stream: bool = False) -> None:
         """
         Forward DMR stream to target repeaters using cached routing.
 
@@ -3821,6 +3858,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             rf_src: RF source subscriber ID (3 bytes) — source-local
             dst_id: Destination TGID (3 bytes) — source-local
             stream_id: Unique stream identifier (4 bytes)
+            end_of_stream: This packet ends the stream though it isn't a
+                terminator (the last block of a data transaction)
         """
         # Get source repeater's stream (which has the routing cache)
         source_repeater = self._repeaters.get(source_repeater_id)
@@ -3863,7 +3902,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         _bits = data[15]
         _frame_type = (_bits & 0x30) >> 4
         _dtype_vseq = _bits & 0xF
-        is_terminator = self._is_dmr_terminator(data, _frame_type)
+        is_terminator = self._is_dmr_terminator(data, _frame_type) or end_of_stream
 
         # Does this frame carry an LC we need to rewrite under translation?
         # Only VHEAD/VTERM (full LC) and voice bursts B/C/D/E (EMB_LC) do.
@@ -4067,11 +4106,16 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Get the current stream for this slot (after _handle_stream_packet has updated it)
         current_stream = repeater.get_slot_stream(_slot)
 
-        # Data streams are tracked (so fast-terminator/contention logic stays
-        # quiet) and emitted to the dashboard, but never forwarded. Drop here
-        # before the forwarding path and before stream_update telemetry —
-        # data calls don't produce meaningful packet-count telemetry anyway.
+        # Data streams: forwarded when routed at stream start (unit data,
+        # `forward_unit_data`), and ended once the header's blocks are all in,
+        # since data has no terminator. No stream_update telemetry.
         if current_stream and current_stream.call_type == 'data':
+            done = self._count_data_frame(current_stream, _frame_type, _dtype_vseq, _payload)
+            if current_stream.target_repeaters:
+                self._forward_stream(data, repeater_id, _slot, _rf_src, _dst_id, _stream_id,
+                                     end_of_stream=done)
+            if done:
+                self._end_stream(current_stream, repeater_id, _slot, time(), 'data_complete')
             return
         
         # Per-packet logging - only enable for heavy troubleshooting
@@ -4105,6 +4149,28 @@ class HBProtocol(asyncio.DatagramProtocol):
         
         # Forward DMR data to other connected repeaters
         self._forward_stream(data, repeater_id, _slot, _rf_src, _dst_id, _stream_id)
+
+    @staticmethod
+    def _count_data_frame(stream: StreamState, frame_type: int, dtype_vseq: int,
+                          payload: bytes) -> bool:
+        """Count a data stream's blocks against its data header's
+        blocks-to-follow; True when this frame completes the transaction.
+        Only response, unconfirmed and confirmed data headers are counted (a
+        proprietary second header counts as one of their blocks)."""
+        if frame_type != 2:
+            return False
+        if stream.data_blocks_left is None:
+            if dtype_vseq != 6:
+                return False
+            header = decode_data_header(payload)
+            if header is None or header['dpf'] not in (1, 2, 3):
+                return False
+            stream.data_blocks_left = header['blocks_to_follow']
+            return stream.data_blocks_left == 0
+        if stream.data_blocks_left > 0 and dtype_vseq in (6, 7, 8, 10):
+            stream.data_blocks_left -= 1
+            return stream.data_blocks_left == 0
+        return False
 
     def _update_assumed_stream(self, repeater: RepeaterState, slot: int, rf_src: bytes,
                               dst_id: bytes, stream_id: bytes, is_terminator: bool,

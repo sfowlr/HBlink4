@@ -108,6 +108,10 @@ class StreamState:
     # Unit calls: outgoing slot per local target, when it differs from the
     # source's (the target radio's last-heard slot). Absent = source slot.
     target_slots: Optional[Dict[Any, int]] = None
+    # Data streams: blocks still to come after the data header (None until the
+    # header is seen, or for data formats that aren't counted). The stream
+    # ends when it reaches 0, since data never sends a terminator.
+    data_blocks_left: Optional[int] = None
 
     # DMR Link Control for outbound rewrites under translation.
     #

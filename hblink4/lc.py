@@ -312,27 +312,28 @@ def decode_data_header(payload: bytes) -> Optional[Dict[str, object]]:
     Returns:
         Dict with keys: group (bool), response_requested (bool),
         dpf (int), dpf_name (str), sap (int), sap_name (str),
-        blocks_to_follow (int) — only meaningful for Confirmed/Unconfirmed
-        Data Headers (DPF 2 or 3), else 0 — and raw (12-byte payload).
+        blocks_to_follow (int) — octet 8 bits 6-0 for Response, Unconfirmed
+        and Confirmed Data Headers (DPF 1, 2, 3), else 0 — and raw (12-byte
+        payload).
         Returns None on decode failure.
 
     Does not verify the CRC-CCITT tail — callers that need confidence can
-    check raw[-2:] against their own CRC implementation. All decoded fields
-    come from bytes 0-1 which are the least CRC-sensitive part of the
-    header.
+    check raw[-2:] against their own CRC implementation. The decoded fields
+    come from bytes 0-1 and 8.
     """
     raw = _decode_bptc_96(payload)
     if raw is None or len(raw) < 12:
         return None
     b0 = raw[0]
     b1 = raw[1]
+    dpf = b0 & 0x0F
     return {
         'group': bool(b0 & 0x80),
         'response_requested': bool(b0 & 0x40),
-        'dpf': b0 & 0x3F,
-        'dpf_name': dpf_name(b0 & 0x3F),
+        'dpf': dpf,
+        'dpf_name': dpf_name(dpf),
         'sap': (b1 >> 4) & 0x0F,
         'sap_name': sap_name((b1 >> 4) & 0x0F),
-        'blocks_to_follow': b1 & 0x0F,
+        'blocks_to_follow': raw[8] & 0x7F if dpf in (1, 2, 3) else 0,
         'raw': raw,
     }
