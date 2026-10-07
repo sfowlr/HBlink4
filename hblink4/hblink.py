@@ -2689,17 +2689,21 @@ class HBProtocol(asyncio.DatagramProtocol):
                     'power': max(0, min(255, int(power))) if isinstance(power, (int, float)) else 255}
         return None
 
-    def _channel_busy(self, freq: int) -> bool:
+    def _channel_busy(self, freq: int, pair: Optional[Tuple[bytes, bytes]] = None) -> bool:
         """Is anything being heard or sent on `freq` right now? Any peer —
         receive-only ones included — with a stream in progress on it: a received
         stream where it was heard (a roamer may have retuned since), one we're
-        sending on the peer's channel."""
+        sending on the peer's channel. `pair` (rf_src, dst_id): a call between
+        those two, either way, doesn't count — it's the call being answered
+        (a receiver may not have seen its end yet)."""
         for r in self._repeaters.values():
             if r.connection_state != 'connected':
                 continue
             for s in (1, 2):
                 stream = r.get_slot_stream(s)
                 if stream is None or stream.ended:
+                    continue
+                if pair is not None and {stream.rf_src, stream.dst_id} == set(pair):
                     continue
                 if stream.freq is not None:
                     if freqs_match(freq, stream.freq):
@@ -2762,7 +2766,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         if channel is None:
             self._route_reason[stream_id] = 'channel not allowed'
             return None
-        if self._channel_busy(channel['freq']):
+        if self._channel_busy(channel['freq'], (rf_src, dst_id)):
             self._route_reason[stream_id] = 'channel busy'
             return None
         call = RoamingCall(channel, rf_src, dst_id, stream_id)

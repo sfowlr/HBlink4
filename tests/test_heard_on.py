@@ -19,8 +19,9 @@ from hblink4 import hblink
 from hblink4.access_control import RepeaterMatcher
 from hblink4.utils import parse_location
 
-from test_roaming import CHANNELS, OTHER, ROAM1, SIMPLEX, dmrt, roamer
-from test_unit_call_routing import MODEM1, RADIO, make_hb, peer, rid, route, sid
+from hblink4.models import StreamState
+from test_roaming import CHANNELS, OTHER, ROAM1, SIMPLEX, dmrt, heard_at, roamer
+from test_unit_call_routing import CONSOLE_RADIO, MODEM1, RADIO, SDR1, make_hb, peer, rid, route, sid
 
 BOT = 9990199
 ADDR = ('10.0.0.9', 40000)
@@ -141,3 +142,23 @@ def test_parse_location():
     assert parse_location(b'91.0', b'10.0') == (None, None, None)
     assert parse_location(b'-33.8688', b'151.2093', b'') == (-33.8688, 151.2093, None)
     assert parse_location('39.1\x00\x00\x00\x00', '-84.5', '7') == (39.1, -84.5, 7)
+
+
+def test_the_call_being_answered_doesnt_make_its_channel_busy():
+    """2026-10-07: the radio's call to Brian, heard by an SDR that hadn't seen its
+    end yet, held Brian's reply off as "channel busy"."""
+    hb = make_hb()
+    r = roamer(hb, ROAM1, freq=OTHER)
+    sdr = hb._repeaters[rid(SDR1)]
+    sdr.rx_freq = str(SIMPLEX).encode()
+    caller = StreamState(repeater_id=rid(SDR1), rf_src=sid(RADIO), dst_id=sid(CONSOLE_RADIO), slot=1,
+                         start_time=0, last_seen=0, stream_id=b'\x09' * 4)
+    caller.freq = SIMPLEX
+    sdr.set_slot_stream(1, caller)
+    heard_at(hb, SIMPLEX)
+    assert hb._channel_busy(SIMPLEX)
+    assert not hb._channel_busy(SIMPLEX, (sid(CONSOLE_RADIO), sid(RADIO)))      # its own reply
+    assert hb._channel_busy(SIMPLEX, (sid(CONSOLE_RADIO), sid(1234)))          # someone else's call
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        assert route(hb, slot=1)[0] == {rid(ROAM1)}                             # CONSOLE_RADIO → RADIO
+    assert dmrt(r)
