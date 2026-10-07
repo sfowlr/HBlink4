@@ -4,8 +4,10 @@ radios on channels no fixed peer transmits on.
 
 - used only when no fixed TX peer is on the radio's channel (busy or not)
 - only for channels in global.roaming_channels, and only when the channel is quiet
-- always TS2; a roamer already on the channel is preferred; a busy one is skipped
-- DMRK on air → its channel is recorded; DMRK refused → the call is dropped, reported
+- always TS2; a roamer already on the channel first, then by priority, equal ones taking turns
+- one hearing a call: never used, used last, or used as needed (roaming_interrupt_rx)
+- DMRK on air → its channel is recorded; refused or unanswered → the next roamer, the
+  call replayed; channel busy (or no roamer left) → the call is dropped, reported
 - never a group-call target
 """
 import os
@@ -52,7 +54,7 @@ def test_a_radio_on_an_uncovered_channel_goes_out_the_roamer_on_ts2():
     with patch.dict(hblink.CONFIG, CHANNELS):
         assert route(hb, slot=1) == ({rid(ROAM1)}, False, {rid(ROAM1): 2})
     [pkt] = dmrt(r)
-    assert pkt == (b'DMRT' + rid(ROAM1) + b'\x01\x02\x03\x04' + SIMPLEX.to_bytes(4, 'big') + bytes([1, 100]))
+    assert pkt == (b'DMRT' + rid(ROAM1) + b'\x01\x02\x03\x04' + SIMPLEX.to_bytes(4, 'big') + bytes([1, 100, 0]))
 
 
 def test_never_roams_onto_a_channel_a_fixed_peer_covers_even_when_its_busy():
@@ -188,3 +190,120 @@ def test_a_radio_heard_by_the_roamer_on_its_idle_channel_is_answered_through_it(
         r.set_slot_stream(2, StreamState(repeater_id=rid(ROAM1), rf_src=sid(RADIO), dst_id=sid(9990199),
                                          slot=2, start_time=0, last_seen=0, stream_id=b'\x07' * 4))
         assert route(hb, stream=b'\x08' * 4) == (set(), False, {})
+
+
+OTHER = 467_375_000             # a roamer's idle channel, away from SIMPLEX
+
+
+def hearing(r, stream_id=b'\x07' * 4):
+    """`r` is receiving a call on its own channel."""
+    r.set_slot_stream(2, StreamState(repeater_id=r.repeater_id, rf_src=sid(1234), dst_id=sid(9990199), slot=2,
+                                     start_time=0, last_seen=0, stream_id=stream_id))
+
+
+def picked(hb, stream):
+    targets = route(hb, stream=stream)[0]
+    return rid_to_int(next(iter(targets))) if targets else None
+
+
+def rid_to_int(b):
+    return int.from_bytes(b, 'big')
+
+
+def test_priority_then_turns_and_one_on_the_channel_always_wins():
+    hb = make_hb()
+    r1, r2, r3 = roamer(hb, ROAM1, freq=OTHER), roamer(hb, ROAM2, freq=OTHER), roamer(hb, 3127003, freq=OTHER)
+    r1.roaming_priority = 200                    # a backup
+    heard_at(hb, SIMPLEX)
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        assert [picked(hb, bytes([i]) * 4) for i in range(1, 5)] == [ROAM2, 3127003, ROAM2, 3127003]
+        r1.rx_freq = r1.tx_freq = str(SIMPLEX).encode()   # the backup is sitting on the channel
+        assert picked(hb, b'\x05' * 4) == ROAM1
+
+
+def test_a_roamer_hearing_a_call_never_last_resort_or_as_needed():
+    hb = make_hb()
+    r1, r2 = roamer(hb, ROAM1, freq=OTHER), roamer(hb, ROAM2, freq=OTHER)
+    r1.roaming_priority, r2.roaming_priority = 10, 100
+    hearing(r1)
+    heard_at(hb, SIMPLEX)
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        assert picked(hb, b'\x01' * 4) == ROAM2                      # default: never
+        r1.roaming_interrupt_rx = 'last_resort'
+        assert picked(hb, b'\x02' * 4) == ROAM2
+        r2.roaming_cooldown_until = 1e12                             # ROAM2 unavailable
+        assert picked(hb, b'\x03' * 4) == ROAM1
+        assert dmrt(r1)[-1][18] == hblink.ROAMING_PREEMPT              # told to drop what it hears
+        r2.roaming_cooldown_until = 0
+        r1.roaming_interrupt_rx = 'as_needed'
+        assert picked(hb, b'\x04' * 4) == ROAM1                      # its priority wins
+        r1.roaming_interrupt_rx = None
+    with patch.dict(hblink.CONFIG, {'global': {**CHANNELS['global'], 'roaming_interrupt_rx': 'as_needed'}}):
+        assert picked(hb, b'\x05' * 4) == ROAM1                      # the global default
+    assert dmrt(r2)[0][18] == 0
+
+
+def test_a_roamer_sending_a_call_is_never_interrupted():
+    hb = make_hb()
+    r1 = roamer(hb, ROAM1, freq=OTHER)
+    r1.roaming_interrupt_rx = 'as_needed'
+    r1.set_slot_stream(2, StreamState(repeater_id=rid(ROAM1), rf_src=sid(1), dst_id=sid(2), slot=2, start_time=0,
+                                      last_seen=0, stream_id=b'\x07' * 4, is_assumed=True, is_unit_call=True))
+    heard_at(hb, SIMPLEX)
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        assert picked(hb, b'\x01' * 4) is None
+
+
+def two_roamers_and_a_call(hb):
+    r1, r2 = roamer(hb, ROAM1, freq=OTHER), roamer(hb, ROAM2, freq=OTHER)
+    r2.roaming_priority = 200
+    heard_at(hb, SIMPLEX)
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        stream = start_call(hb)
+    assert stream.target_repeaters == {rid(ROAM1)} and not dmrt(r2)
+    return r1, r2, stream
+
+
+def test_a_refusal_hands_the_call_to_the_next_roamer_with_what_was_sent():
+    hb = make_hb()
+    r1, r2, stream = two_roamers_and_a_call(hb)
+    sent_to_r1 = [p for p in r1.sent if p[:4] == b'DMRD']
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        hb._handle_roaming_ack(rid(ROAM1), dmrk(b'\xaa\xbb\xcc\xdd', 4))         # transceiver busy
+    assert stream.target_repeaters == {rid(ROAM2)} and stream.target_slots[rid(ROAM2)] == 2
+    assert len(dmrt(r2)) == 1 and [p for p in r2.sent if p[:4] == b'DMRD'] == sent_to_r1
+    assert r1.get_slot_stream(2) is None and r2.get_slot_stream(2).is_assumed
+    assert not [e for e in hb._events.emitted if e[0] == 'unit_call_unroutable']
+    hb._handle_roaming_ack(rid(ROAM2), dmrk(b'\xaa\xbb\xcc\xdd', 0, peer_id=ROAM2))
+    assert not hb._roaming_calls
+
+
+def test_a_busy_channel_ends_it_there_and_a_radio_error_benches_the_roamer():
+    hb = make_hb()
+    r1, r2, stream = two_roamers_and_a_call(hb)
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        hb._handle_roaming_ack(rid(ROAM1), dmrk(b'\xaa\xbb\xcc\xdd', 1))         # channel busy
+    assert stream.target_repeaters == set() and not dmrt(r2)
+    assert [e[1]['reason'] for e in hb._events.emitted if e[0] == 'unit_call_unroutable'] == ['channel busy']
+
+    hb = make_hb()
+    r1, r2, stream = two_roamers_and_a_call(hb)
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        hb._handle_roaming_ack(rid(ROAM1), dmrk(b'\xaa\xbb\xcc\xdd', 3))         # radio error
+        assert stream.target_repeaters == {rid(ROAM2)}
+        hb._handle_roaming_ack(rid(ROAM2), dmrk(b'\xaa\xbb\xcc\xdd', 0, peer_id=ROAM2))
+        assert picked(hb, b'\x09' * 4) != ROAM1                              # benched for a while
+
+
+def test_no_answer_moves_the_call_on_and_the_last_roamer_failing_drops_it():
+    hb = make_hb()
+    r1, r2, stream = two_roamers_and_a_call(hb)
+    with patch.dict(hblink.CONFIG, CHANNELS):
+        hb._roaming_calls[b'\xaa\xbb\xcc\xdd'].sent_at -= 10
+        hb._check_roaming_acks()
+        assert stream.target_repeaters == {rid(ROAM2)} and r1.roaming_cooldown_until > 0
+        hb._handle_roaming_ack(rid(ROAM2), dmrk(b'\xaa\xbb\xcc\xdd', 4, peer_id=ROAM2))
+    assert stream.target_repeaters == set() and not hb._roaming_calls
+    assert [e[1]['reason'] for e in hb._events.emitted if e[0] == 'unit_call_unroutable'] == ['transceiver busy']
+    hb._handle_roaming_ack(rid(ROAM1), dmrk(b'\xaa\xbb\xcc\xdd', 0))              # a late answer: ignored
+    assert stream.target_repeaters == set()

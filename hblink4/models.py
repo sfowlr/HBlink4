@@ -288,6 +288,10 @@ class RepeaterState:
     # DMRT, answered with DMRK. Its rx_freq/tx_freq/colorcode follow the
     # channel it last confirmed (DMRK or its DMRC keepalive).
     roaming: bool = False
+    roaming_priority: int = 100
+    roaming_interrupt_rx: Optional[str] = None   # None: global.roaming_interrupt_rx
+    roaming_last_used: int = 0                   # turn number of the last call it was sent (turn-taking)
+    roaming_cooldown_until: float = 0.0          # skipped until then (radio error / no answer)
 
     # DMRD translation maps (inverses of each other; empty = no translation).
     # inbound_map:  local (slot,tgid) → network (slot,tgid) — applied when this

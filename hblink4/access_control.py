@@ -76,6 +76,21 @@ class RepeaterConfig:
     # to reach radios on channels no fixed peer transmits on. Never gets group
     # traffic; used for a unit call only when no fixed TX peer is on the channel.
     roaming: bool = False
+    # Roaming transceivers only. Picking one for a call: one already idling on
+    # the channel first; then lower `roaming_priority`, equal ones taking turns
+    # (least recently used). `roaming_interrupt_rx`: may it be pulled off a call
+    # it's hearing to transmit elsewhere — "never", "last_resort" (only when no
+    # other roamer is free) or "as_needed"; None = global.roaming_interrupt_rx.
+    roaming_priority: int = 100
+    roaming_interrupt_rx: Optional[str] = None
+
+    def __post_init__(self):
+        if self.roaming_interrupt_rx not in (None,) + ROAMING_INTERRUPT_MODES:
+            raise ValueError(f"roaming_interrupt_rx must be one of {ROAMING_INTERRUPT_MODES}, "
+                             f"not {self.roaming_interrupt_rx!r}")
+
+
+ROAMING_INTERRUPT_MODES = ('never', 'last_resort', 'as_needed')
 
 @dataclass
 class PatternMatch:

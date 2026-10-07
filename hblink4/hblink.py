@@ -32,6 +32,24 @@ CONFIG: Dict[str, Any] = {}
 ROAMING_SLOT = 2
 ROAMING_ON_AIR = 0
 ROAMING_STATUS = {1: 'channel busy', 2: 'channel not allowed', 3: 'radio error', 4: 'transceiver busy'}
+ROAMING_CHANNEL_BUSY, ROAMING_RADIO_ERROR = 1, 3
+ROAMING_PREEMPT = 0x01        # DMRT [18] flags: tune away even from a call it's hearing
+ROAMING_ACK_TIMEOUT = 2.0     # no DMRK by then: try the next roamer
+ROAMING_COOLDOWN = 30.0       # a roamer that failed (radio error, no answer) is skipped this long
+ROAMING_REPLAY_MAX = 200      # packets kept per call until its DMRK, to replay to the next roamer
+
+
+class RoamingCall:
+    """A unit call sent to a roaming transceiver, until it answers DMRK on air:
+    what's needed to hand it to another roamer if this one can't."""
+
+    def __init__(self, channel: Dict[str, int], rf_src: bytes, dst_id: bytes, stream_id: bytes):
+        self.channel, self.rf_src, self.dst_id, self.stream_id = channel, rf_src, dst_id, stream_id
+        self.roamer: Optional[bytes] = None
+        self.sent_at = 0.0
+        self.tried: Set[bytes] = set()
+        self.packets: List[Tuple[bytes, bool]] = []      # (DMRD as sent, is terminator)
+        self.source_rid = 0
 
 LOGGER = logging.getLogger(__name__)
 
@@ -124,6 +142,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         super().__init__()
         # All inbound connections (repeaters, hotspots, network links) - see models.py terminology note
         self._repeaters: Dict[bytes, RepeaterState] = {}
+        self._roaming_calls: Dict[bytes, RoamingCall] = {}    # stream id → call awaiting its DMRK
+        self._roaming_turn = 0                                # counts calls given to roamers
         
         # Outbound connection state management (Phase 2)
         self._outbounds: Dict[str, 'OutboundState'] = {}  # keyed by connection name
@@ -299,6 +319,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         repeater.unit_calls_enabled = repeater_config.default_unit_calls
         repeater.tx_capable = repeater_config.tx
         repeater.roaming = repeater_config.roaming
+        repeater.roaming_priority = repeater_config.roaming_priority
+        repeater.roaming_interrupt_rx = repeater_config.roaming_interrupt_rx
         LOGGER.debug(
             f'Repeater {rid_to_int(repeater_id)} unit calls '
             f'{"ENABLED" if repeater.unit_calls_enabled else "DISABLED"} (pattern default)'
@@ -1109,11 +1131,14 @@ class HBProtocol(asyncio.DatagramProtocol):
             # target radio's slot.
             out_slot = (source_stream.target_slots or {}).get(target_repeater_id, _slot)
             if out_slot == _slot:
-                target_repeater.send(data)
+                packet = data
             else:
                 buf = bytearray(data)
                 buf[15] = (buf[15] | 0x80) if out_slot == 2 else (buf[15] & 0x7F)
-                target_repeater.send(bytes(buf))
+                packet = bytes(buf)
+            target_repeater.send(packet)
+            if target_repeater.roaming:
+                self._roaming_sent(_stream_id, packet, is_terminator, _rf_src, _dst_id, remote_repeater_id)
             self._update_assumed_stream(
                 target_repeater, out_slot, _rf_src, _dst_id, _stream_id,
                 is_terminator, remote_repeater_id,
@@ -1224,6 +1249,11 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Start stream timeout checker (check more frequently than repeater timeout)
         self._tasks.append(
             asyncio.create_task(self._run_periodic(1.0, self._check_stream_timeouts, "stream timeout checker"))
+        )
+
+        # Roaming transceivers that haven't answered DMRT
+        self._tasks.append(
+            asyncio.create_task(self._run_periodic(0.25, self._check_roaming_acks, "roaming ack checker"))
         )
         
         # Start user cache cleanup (fixed at 60s for optimal efficiency)
@@ -2609,33 +2639,164 @@ class HBProtocol(asyncio.DatagramProtocol):
                     return True
         return False
 
+    def _roamer_state(self, r: RepeaterState, stream_id: bytes, rf_src: bytes, dst_id: bytes) -> Optional[str]:
+        """'free'; 'rx' — hearing a call on its channel (or in that call's hang
+        time); or None — sending one, or holding its slot for a conversation."""
+        hearing = False
+        for s in (1, 2):
+            if not self._is_slot_busy(r.repeater_id, s, stream_id, rf_src, dst_id, is_unit_call=True):
+                continue
+            stream = r.get_slot_stream(s)
+            if stream is None or stream.is_assumed:
+                return None
+            hearing = True
+        return 'rx' if hearing else 'free'
+
+    def _roaming_candidates(self, channel: Dict[str, int], stream_id: bytes, rf_src: bytes,
+                            dst_id: bytes, exclude: Set[bytes] = frozenset()) -> List[Tuple[RepeaterState, bool]]:
+        """Roamers that could take the call, best first, each with whether it'd
+        have to drop a call it's hearing (DMRT preempt):
+          1. one idling on the channel already (no retune; it's been listening there);
+          2. by `roaming_priority` (lower first), then the one used longest ago, so
+             equal priorities take turns. A roamer hearing a call counts here if its
+             `roaming_interrupt_rx` is "as_needed";
+          3. "last_resort" roamers hearing a call, the same way.
+        "never": a roamer hearing a call isn't a candidate."""
+        now = time()
+        default_mode = CONFIG.get('global', {}).get('roaming_interrupt_rx', 'never')
+        ranked = []
+        for r in self._repeaters.values():
+            if not (r.roaming and r.tx_capable and r.unit_calls_enabled and r.connection_state == 'connected'):
+                continue
+            if r.repeater_id in exclude or r.roaming_cooldown_until > now:
+                continue
+            state = self._roamer_state(r, stream_id, rf_src, dst_id)
+            if state is None:
+                continue
+            if state == 'rx':
+                mode = r.roaming_interrupt_rx or default_mode
+                if mode == 'never':
+                    continue
+                tier = 2 if mode == 'last_resort' else 1
+            else:
+                on_channel = (freqs_match(channel['freq'], parse_freq_hz(r.tx_freq))
+                              and parse_colorcode(r.colorcode) == channel['cc'])
+                tier = 0 if on_channel else 1
+            ranked.append(((tier, r.roaming_priority, r.roaming_last_used, r.repeater_id), r, state == 'rx'))
+        ranked.sort(key=lambda t: t[0])
+        return [(r, preempt) for _, r, preempt in ranked]
+
     def _roaming_route(self, freq: int, colorcode: Optional[int], rf_src: bytes, dst_id: bytes,
                        stream_id: bytes) -> Optional[Tuple[bytes, int]]:
         channel = self._roaming_channel(freq, colorcode)
         if channel is None or self._channel_busy(channel['freq']):
             return None
-        roamers = [
-            r for r in self._repeaters.values()
-            if r.roaming and r.tx_capable and r.unit_calls_enabled and r.connection_state == 'connected'
-            and not any(self._is_slot_busy(r.repeater_id, s, stream_id, rf_src, dst_id, is_unit_call=True)
-                        for s in (1, 2))]
-        if not roamers:
+        call = RoamingCall(channel, rf_src, dst_id, stream_id)
+        roamer = self._roaming_dispatch(call)
+        return (roamer.repeater_id, ROAMING_SLOT) if roamer is not None else None
+
+    def _roaming_dispatch(self, call: RoamingCall) -> Optional[RepeaterState]:
+        """DMRT to the best roamer not yet tried for `call`; None if there's none."""
+        candidates = self._roaming_candidates(call.channel, call.stream_id, call.rf_src, call.dst_id,
+                                              exclude=call.tried)
+        if not candidates:
+            self._roaming_calls.pop(call.stream_id, None)
             return None
-        # One already on the channel needn't retune.
-        roamers.sort(key=lambda r: (
-            not (freqs_match(channel['freq'], parse_freq_hz(r.tx_freq))
-                 and parse_colorcode(r.colorcode) == channel['cc']),
-            r.repeater_id))
-        roamer = roamers[0]
-        roamer.send(b''.join([DMRT, roamer.repeater_id, stream_id, channel['freq'].to_bytes(4, 'big'),
-                              bytes([channel['cc'], channel['power']])]))
+        roamer, preempt = candidates[0]
+        channel = call.channel
+        roamer.send(b''.join([DMRT, roamer.repeater_id, call.stream_id, channel['freq'].to_bytes(4, 'big'),
+                              bytes([channel['cc'], channel['power'], ROAMING_PREEMPT if preempt else 0])]))
+        self._roaming_turn += 1
+        roamer.roaming_last_used = self._roaming_turn
+        call.roamer, call.sent_at = roamer.repeater_id, time()
+        call.tried.add(roamer.repeater_id)
+        self._roaming_calls[call.stream_id] = call
         LOGGER.info(f'Roaming transceiver {rid_to_int(roamer.repeater_id)} → '
-                    f'{channel["freq"] / 1e6:.5f} MHz CC{channel["cc"]} for stream {stream_id.hex()}')
-        return (roamer.repeater_id, ROAMING_SLOT)
+                    f'{channel["freq"] / 1e6:.5f} MHz CC{channel["cc"]} for stream {call.stream_id.hex()}'
+                    + (' (dropping a call it\'s hearing)' if preempt else ''))
+        return roamer
+
+    def _roaming_sent(self, stream_id: bytes, packet: bytes, is_terminator: bool,
+                      rf_src: bytes, dst_id: bytes, source_rid: int) -> None:
+        """A packet went to a roamer: keep it until the roamer is on air, in case
+        the call has to go to another one."""
+        call = self._roaming_calls.get(stream_id)
+        if call is None:
+            return
+        if not call.packets:
+            call.rf_src, call.dst_id, call.source_rid = rf_src, dst_id, source_rid
+        if len(call.packets) < ROAMING_REPLAY_MAX:
+            call.packets.append((packet, is_terminator))
+
+    def _roaming_source_stream(self, stream_id: bytes) -> Optional[Tuple[Any, int, StreamState]]:
+        """The stream (not a roamer's assumed copy) a roamed call comes from."""
+        for owner in list(self._repeaters.values()) + list(self._outbounds.values()):
+            if getattr(owner, 'roaming', False):
+                continue
+            for s in (1, 2):
+                stream = owner.get_slot_stream(s)
+                if stream is not None and stream.stream_id == stream_id:
+                    return owner, s, stream
+        return None
+
+    def _roaming_failed(self, roamer: RepeaterState, stream_id: bytes, reason: str,
+                        try_another: bool) -> None:
+        """`roamer` won't send `stream_id`: free it, and hand the call to the
+        next roamer — replaying what was already sent — or drop it and say why."""
+        stream = roamer.get_slot_stream(ROAMING_SLOT)
+        if stream is not None and stream.stream_id == stream_id:
+            roamer.set_slot_stream(ROAMING_SLOT, None)      # its assumed stream: it's free
+        call = self._roaming_calls.get(stream_id)
+        source = self._roaming_source_stream(stream_id)
+        if call is None or call.roamer != roamer.repeater_id:
+            return                                           # an old call, already handed on
+        if source is None:
+            self._roaming_calls.pop(stream_id, None)        # the call itself is gone
+            return
+        nxt = self._roaming_dispatch(call) if try_another else None
+        owner, slot, src_stream = source
+        targets = src_stream.target_repeaters
+        if targets is not None:
+            targets.discard(roamer.repeater_id)
+        if nxt is not None:
+            if targets is not None:
+                targets.add(nxt.repeater_id)
+            src_stream.target_slots = dict(src_stream.target_slots or {})
+            src_stream.target_slots.pop(roamer.repeater_id, None)
+            src_stream.target_slots[nxt.repeater_id] = ROAMING_SLOT
+            for packet, is_terminator in call.packets:
+                nxt.send(packet)
+                self._update_assumed_stream(nxt, ROAMING_SLOT, call.rf_src, call.dst_id, stream_id,
+                                            is_terminator, call.source_rid, is_unit_call=True)
+            LOGGER.info(f'Roamed call {stream_id.hex()} moved from {rid_to_int(roamer.repeater_id)} '
+                        f'({reason}) to {rid_to_int(nxt.repeater_id)}, {len(call.packets)} packets replayed')
+            return
+        self._roaming_calls.pop(stream_id, None)
+        self._events.emit('unit_call_unroutable', {
+            'repeater_id': rid_to_int(src_stream.repeater_id) if src_stream.repeater_id else None,
+            'slot': slot, 'src_id': bytes_to_int(src_stream.rf_src),
+            'dst_id': bytes_to_int(src_stream.dst_id), 'reason': reason})
+
+    def _check_roaming_acks(self) -> None:
+        """A roamer that hasn't answered DMRT in time is skipped for a while and
+        the call goes to the next one."""
+        now = time()
+        for stream_id, call in list(self._roaming_calls.items()):
+            if now - call.sent_at < CONFIG.get('global', {}).get('roaming_ack_timeout', ROAMING_ACK_TIMEOUT):
+                continue
+            roamer = self._repeaters.get(call.roamer)
+            if roamer is None:
+                self._roaming_calls.pop(stream_id, None)
+                continue
+            LOGGER.warning(f'Roaming transceiver {rid_to_int(roamer.repeater_id)} did not answer '
+                           f'for stream {stream_id.hex()}')
+            roamer.roaming_cooldown_until = now + ROAMING_COOLDOWN
+            self._roaming_failed(roamer, stream_id, 'no answer', try_another=True)
 
     def _handle_roaming_ack(self, repeater_id: bytes, data: bytes) -> None:
-        """DMRK: the roaming transceiver is on air for the stream, or isn't
-        (the call is then dropped and reported unroutable)."""
+        """DMRK: the roaming transceiver is on air for the stream, or isn't. If
+        it isn't, the call goes to the next roamer — unless the channel itself
+        was busy, which it would be for any of them — or is dropped and reported."""
         repeater = self._repeaters.get(repeater_id)
         if repeater is None or not repeater.roaming or len(data) < 18:
             return
@@ -2643,6 +2804,9 @@ class HBProtocol(asyncio.DatagramProtocol):
         freq, cc = int.from_bytes(data[13:17], 'big'), data[17]
         rid_int = rid_to_int(repeater_id)
         if status == ROAMING_ON_AIR:
+            call = self._roaming_calls.get(stream_id)
+            if call is not None and call.roamer == repeater_id:
+                del self._roaming_calls[stream_id]
             repeater.rx_freq = repeater.tx_freq = str(freq).encode()
             repeater.colorcode = str(cc).encode()
             LOGGER.info(f'Roaming transceiver {rid_int} on air at {freq / 1e6:.5f} MHz CC{cc} '
@@ -2652,19 +2816,9 @@ class HBProtocol(asyncio.DatagramProtocol):
             return
         reason = ROAMING_STATUS.get(status, f'status {status}')
         LOGGER.warning(f'Roaming transceiver {rid_int} did not send stream {stream_id.hex()}: {reason}')
-        for owner in list(self._repeaters.values()) + list(self._outbounds.values()):
-            for s in (1, 2):
-                stream = owner.get_slot_stream(s)
-                if stream is None or stream.stream_id != stream_id:
-                    continue
-                if owner is repeater:
-                    owner.set_slot_stream(s, None)          # the roamer's assumed stream: it's free
-                elif stream.target_repeaters and repeater_id in stream.target_repeaters:
-                    stream.target_repeaters.discard(repeater_id)
-                    self._events.emit('unit_call_unroutable', {
-                        'repeater_id': rid_to_int(stream.repeater_id) if stream.repeater_id else None,
-                        'slot': s, 'src_id': bytes_to_int(stream.rf_src),
-                        'dst_id': bytes_to_int(stream.dst_id), 'reason': reason})
+        if status == ROAMING_RADIO_ERROR:
+            repeater.roaming_cooldown_until = time() + ROAMING_COOLDOWN
+        self._roaming_failed(repeater, stream_id, reason, try_another=status != ROAMING_CHANNEL_BUSY)
 
     def _calculate_unit_call_targets(self, source_repeater_id: Optional[bytes], slot: int,
                                       rf_src: bytes, dst_id: bytes, stream_id: bytes,
@@ -4039,10 +4193,13 @@ class HBProtocol(asyncio.DatagramProtocol):
                         and not source_translated
                         and (out_slot, out_dst) == (slot, dst_id)
                         and net_rf_src == rf_src):
-                    target_repeater.send(data)
+                    packet = data
                 else:
                     packet = build_target_packet(out_slot, out_dst, net_rf_src, None)
-                    target_repeater.send(packet)
+                target_repeater.send(packet)
+                if target_repeater.roaming:
+                    self._roaming_sent(stream_id, packet, is_terminator, net_rf_src, out_dst,
+                                       int.from_bytes(source_repeater_id, 'big'))
 
                 # Track assumed stream state on target repeater using target-local values
                 self._update_assumed_stream(target_repeater, out_slot, net_rf_src, out_dst,

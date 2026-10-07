@@ -224,7 +224,7 @@ mode). It registers with DMRC like MMDVMHost, under a pattern with
 `roaming: true`; the RX/TX frequency in its DMRC keepalive is the channel it's
 on now. Two packets are added:
 
-1. **DMRT** — tune for a stream (master → peer, 18 bytes), sent before the
+1. **DMRT** — tune for a stream (master → peer, 19 bytes), sent before the
    stream's first DMRD:
    ```
    [0:4]   'DMRT'
@@ -233,7 +233,10 @@ on now. Two packets are added:
    [12:16] frequency, Hz, big-endian (simplex: RX = TX)
    [16]    color code
    [17]    power, 0-255 (MMDVM RF level; 255 = the radio's own setting)
+   [18]    flags: 0x01 preempt — tune away even from a call it's hearing
+           (HBlink4 decided to interrupt it; see `roaming_interrupt_rx`)
    ```
+   Older transceivers read the first 18 bytes and ignore the flags.
 2. **DMRK** — the answer (peer → master, 18 bytes), once the transceiver has
    tuned and listened before talking:
    ```
@@ -245,8 +248,12 @@ on now. Two packets are added:
    [13:17] frequency, Hz, big-endian
    [17]    color code
    ```
-   On anything but 0 the transceiver discards the stream; HBlink4 stops
-   forwarding it and emits `unit_call_unroutable` with the reason.
+   On anything but 0 the transceiver discards the stream and HBlink4 stops
+   forwarding it there. Unless the channel was busy (it would be for any
+   transceiver), HBlink4 sends DMRT to the next roamer and replays the stream
+   from its start; with none left it emits `unit_call_unroutable` with the
+   reason. No DMRK within `roaming_ack_timeout` (2 s) counts as a refusal.
+   A transceiver that answered "radio error" or nothing is skipped for 30 s.
 
 DMRD for a stream with no DMRT is dropped by the transceiver.
 
