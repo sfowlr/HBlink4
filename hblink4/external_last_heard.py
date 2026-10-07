@@ -10,7 +10,9 @@ for that radio to the TX-capable peer on that channel.
 
 Config (`global.external_last_heard`):
     {"host": "localhost", "port": 1883, "username": "...", "password": "...",
-     "topic": "hblink4/last_heard", "tls": false}
+     "topic": "hblink4/last_heard", "tls": false,
+     "status_topic": "hblink4/unit_call"}      optional: unit-call outcomes are published
+                                               here (HBProtocol._unit_call_status)
 
 Messages on `{topic}` or `{topic}/...` (retained or not): one JSON object or a
 list of them:

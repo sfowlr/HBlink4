@@ -9,6 +9,7 @@ communication between DMR repeaters and servers.
 License: GNU GPLv3
 """
 
+import collections
 import json
 import logging
 import logging.handlers
@@ -208,6 +209,10 @@ class HBProtocol(asyncio.DatagramProtocol):
         for radio_id, repeater_id in CONFIG.get('global', {}).get('static_subscribers', {}).items():
             self._user_cache.pin(int(radio_id), int(repeater_id))
         self._external_last_heard = None
+        # Unit-call outcomes already reported, per stream (newest last): no repeats.
+        self._unit_status: "collections.OrderedDict[bytes, str]" = collections.OrderedDict()
+        # Why _roaming_route couldn't place a stream, for its outcome report.
+        self._route_reason: Dict[bytes, str] = {}
         
         # No conversion caching - simple int.from_bytes() is fast enough
         # and avoids unbounded cache growth (memory leak prevention)
@@ -2398,6 +2403,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 f'src={src_int} → dst={dst_int} stream_id={stream_id.hex()} '
                 f'[repeater has unit_calls_enabled=False]'
             )
+            self._unit_call_status(stream_id, src_int, dst_int, 'failed', 'unit calls not enabled')
             return False
 
         current_stream = repeater.get_slot_stream(slot)
@@ -2427,6 +2433,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                             f'{bytes_to_int(current_stream.dst_id)}, '
                             f'denied src={src_int} → dst={dst_int}'
                         )
+                        self._unit_call_status(stream_id, src_int, dst_int, 'failed', 'slot in hang time')
                         return False
                 else:
                     # Prior stream was a group call; only same source can break through
@@ -2435,6 +2442,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                             f'UNIT CALL hang-time hijack blocked on repeater {rid_int} TS{slot}: '
                             f'slot in group-call hang time, denied src={src_int} → dst={dst_int}'
                         )
+                        self._unit_call_status(stream_id, src_int, dst_int, 'failed', 'slot in hang time')
                         return False
                 # fall through to create new stream
             else:
@@ -2487,6 +2495,13 @@ class HBProtocol(asyncio.DatagramProtocol):
             self._events.emit('unit_call_unroutable', {
                 'repeater_id': rid_int, 'slot': slot, 'src_id': src_int, 'dst_id': dst_int,
             })
+        reason = self._route_reason.pop(stream_id, None)
+        if not target_repeaters:
+            self._unit_call_status(stream_id, src_int, dst_int, 'failed', reason or 'no route')
+        elif is_broadcast:
+            self._unit_call_status(stream_id, src_int, dst_int, 'routed', 'broadcast')
+        elif stream_id not in self._roaming_calls:        # a roamer answers DMRK first
+            self._unit_call_status(stream_id, src_int, dst_int, 'routed')
 
         LOGGER.info(
             f'Unit RX stream started on repeater {rid_int} TS/RID: {slot}/{dst_int} '
@@ -2521,6 +2536,31 @@ class HBProtocol(asyncio.DatagramProtocol):
             )
 
         return True
+
+    def _unit_call_status(self, stream_id: bytes, src: int, dst: int, status: str,
+                          reason: Optional[str] = None, **extra: Any) -> None:
+        """Report what became of a unit call: 'routed' (forwarded to a fixed
+        peer or outbound, or broadcast), 'on_air' (a roaming transceiver is
+        sending it) or 'failed' (with `reason`). An event, and on MQTT at
+        `{external_last_heard.status_topic}/{src}` so the caller (e.g. a bot)
+        can send it again. Each status once per stream."""
+        if self._unit_status.get(stream_id) == status:
+            return
+        self._unit_status[stream_id] = status
+        self._unit_status.move_to_end(stream_id)
+        while len(self._unit_status) > 512:
+            self._unit_status.popitem(last=False)
+        data = {'stream_id': stream_id.hex(), 'src_id': src, 'dst_id': dst, 'status': status, **extra}
+        if reason:
+            data['reason'] = reason
+        self._events.emit('unit_call_status', data)
+        topic = (CONFIG.get('global', {}).get('external_last_heard') or {}).get('status_topic')
+        if topic and self._external_last_heard is not None:
+            try:
+                self._external_last_heard.publish(f'{topic.rstrip("/")}/{src}', json.dumps({**data, 'at': time()}),
+                                                  qos=1)
+            except Exception as e:
+                LOGGER.warning(f'Unit-call status not published: {e}')
 
     def _peer_channel(self, repeater_id: int) -> Dict[str, Any]:
         """Where a local peer is hearing right now, as user-cache kwargs: the
@@ -2719,11 +2759,18 @@ class HBProtocol(asyncio.DatagramProtocol):
     def _roaming_route(self, freq: int, colorcode: Optional[int], rf_src: bytes, dst_id: bytes,
                        stream_id: bytes) -> Optional[Tuple[bytes, int]]:
         channel = self._roaming_channel(freq, colorcode)
-        if channel is None or self._channel_busy(channel['freq']):
+        if channel is None:
+            self._route_reason[stream_id] = 'channel not allowed'
+            return None
+        if self._channel_busy(channel['freq']):
+            self._route_reason[stream_id] = 'channel busy'
             return None
         call = RoamingCall(channel, rf_src, dst_id, stream_id)
         roamer = self._roaming_dispatch(call)
-        return (roamer.repeater_id, ROAMING_SLOT) if roamer is not None else None
+        if roamer is None:
+            self._route_reason[stream_id] = 'no roaming transceiver free'
+            return None
+        return (roamer.repeater_id, ROAMING_SLOT)
 
     def _roaming_dispatch(self, call: RoamingCall) -> Optional[RepeaterState]:
         """DMRT to the best roamer not yet tried for `call`; None if there's none."""
@@ -2806,6 +2853,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             'repeater_id': rid_to_int(src_stream.repeater_id) if src_stream.repeater_id else None,
             'slot': slot, 'src_id': bytes_to_int(src_stream.rf_src),
             'dst_id': bytes_to_int(src_stream.dst_id), 'reason': reason})
+        self._unit_call_status(stream_id, bytes_to_int(src_stream.rf_src), bytes_to_int(src_stream.dst_id),
+                               'failed', reason)
 
     def _check_roaming_acks(self) -> None:
         """A roamer that hasn't answered DMRT in time is skipped for a while and
@@ -2846,6 +2895,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                         f'for stream {stream_id.hex()}')
             self._events.emit('roaming_on_air', {'repeater_id': rid_int, 'stream_id': stream_id.hex(),
                                                  'freq': freq, 'colorcode': cc})
+            if call is not None and call.roamer == repeater_id:
+                self._unit_call_status(stream_id, bytes_to_int(call.rf_src), bytes_to_int(call.dst_id), 'on_air',
+                                       repeater_id=rid_int, freq=freq, colorcode=cc)
             return
         reason = ROAMING_STATUS.get(status, f'status {status}')
         LOGGER.warning(f'Roaming transceiver {rid_int} did not send stream {stream_id.hex()}: {reason}')
