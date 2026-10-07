@@ -648,6 +648,17 @@ class EventReceiver:
                 del state.repeaters[data['repeater_id']]
                 logger.info(f"Repeater disconnected: {data['repeater_id']} ({data.get('callsign', 'UNKNOWN')}) - reason: {data.get('reason', 'unknown')}")
         
+        elif event_type == 'repeater_channel':
+            # A roaming peer retuned, or a peer's location changed (DMRC)
+            rid = data['repeater_id']
+            if rid in state.repeaters:
+                state.repeaters[rid].update(
+                    {k: data[k] for k in ('rx_freq', 'tx_freq', 'colorcode', 'latitude', 'longitude', 'height')
+                     if k in data})
+            if rid in state.repeater_details:
+                state.repeater_details[rid].update(
+                    {k: data[k] for k in ('latitude', 'longitude', 'height') if k in data})
+
         elif event_type == 'repeater_details':
             # Store detailed repeater information (sent once on connection)
             state.repeater_details[data['repeater_id']] = {

@@ -313,3 +313,24 @@ def parse_colorcode(value) -> Optional[int]:
 
 def freqs_match(a: Optional[int], b: Optional[int]) -> bool:
     return a is not None and b is not None and abs(a - b) <= FREQ_MATCH_TOLERANCE_HZ
+
+
+def _ascii_float(value) -> Optional[float]:
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode('ascii', 'ignore')
+    try:
+        return float(str(value).strip().strip('\x00'))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_location(latitude, longitude, height=b'') -> Tuple[Optional[float], Optional[float], Optional[int]]:
+    """A peer's location as RPTC (or DMRC's optional tail) writes it — ASCII
+    latitude, longitude (degrees) and antenna height above ground (m) — →
+    (lat, lon, height). (None, None, None) when unset: missing, unparseable,
+    out of range, or 0/0 (what most hotspots send when not configured)."""
+    lat, lon = _ascii_float(latitude), _ascii_float(longitude)
+    if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0):
+        return None, None, None
+    h = _ascii_float(height)
+    return lat, lon, (int(round(h)) if h is not None else None)

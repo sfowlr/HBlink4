@@ -142,9 +142,12 @@ def test_on_air_ack_records_the_channel():
     dmrd = [p for p in r.sent if p[:4] == b'DMRD']
     assert len(dmrd) == 1 and dmrd[0][15] & 0x80                   # forwarded, on TS2
     hb._handle_roaming_ack(rid(ROAM1), dmrk(b'\xaa\xbb\xcc\xdd', 0))
-    assert (r.tx_freq, r.colorcode) == (str(SIMPLEX).encode(), b'1')
+    assert (r.tx_freq, r.colorcode) == (str(SIMPLEX).encode(), b'01')          # as DMRC writes them
     assert ('roaming_on_air', {'repeater_id': ROAM1, 'stream_id': 'aabbccdd', 'freq': SIMPLEX,
                                'colorcode': 1}) in hb._events.emitted
+    assert ('repeater_channel', {'repeater_id': ROAM1, 'rx_freq': str(SIMPLEX), 'tx_freq': str(SIMPLEX),
+                                 'colorcode': '01', 'latitude': None, 'longitude': None,
+                                 'height': None}) in hb._events.emitted
 
 
 def test_refused_ack_drops_the_call_frees_the_roamer_and_reports_it():

@@ -70,7 +70,7 @@ try:
     from .utils import (
         safe_decode_bytes, normalize_addr, rid_to_int, bytes_to_int,
         cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type,
-        fmt_ts_tg, parse_freq_hz, parse_colorcode, freqs_match
+        fmt_ts_tg, parse_freq_hz, parse_colorcode, freqs_match, parse_location
     )
     from .config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from .protocol import (
@@ -103,7 +103,7 @@ except ImportError:
     from utils import (
         safe_decode_bytes, normalize_addr, rid_to_int, bytes_to_int,
         cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type,
-        fmt_ts_tg, parse_freq_hz, parse_colorcode, freqs_match
+        fmt_ts_tg, parse_freq_hz, parse_colorcode, freqs_match, parse_location
     )
     from config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from protocol import (
@@ -278,6 +278,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             'rx_freq': repeater.get_rx_freq_str(),
             'tx_freq': repeater.get_tx_freq_str(),
             'colorcode': repeater.get_colorcode_str(),
+            **dict(zip(('latitude', 'longitude', 'height'),
+                       parse_location(repeater.latitude, repeater.longitude, repeater.height))),
             'connection_type': repeater.connection_type,
             'software_id': safe_decode_bytes(repeater.software_id),
             'package_id': safe_decode_bytes(repeater.package_id),
@@ -1398,7 +1400,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                           slot: int, src_id: bytes, dst_id: bytes, stream_id: bytes,
                           call_type: str, is_assumed: bool = False,
                           remote_repeater_id: int = None,
-                          is_data: bool = False) -> None:
+                          is_data: bool = False,
+                          heard_on: Optional[Dict[str, Any]] = None) -> None:
         """
         Stream_start event emission for all connection types.
 
@@ -1416,6 +1419,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             is_data: True for data calls (APRS/SMS/CSBK/etc.). Kept orthogonal
                 to call_type so dashboards can render both dimensions (group
                 vs unit AND voice vs data) without encoding them in one string.
+            heard_on: For received streams, where it was heard (_peer_channel):
+                adds freq (Hz), colorcode, latitude, longitude, height.
         """
         event_data = {
             'slot': slot,
@@ -1434,7 +1439,9 @@ class HBProtocol(asyncio.DatagramProtocol):
             event_data['connection_name'] = connection_id
             if remote_repeater_id is not None:
                 event_data['remote_repeater_id'] = remote_repeater_id
-            
+        if heard_on:
+            event_data.update(heard_on)
+
         self._events.emit('stream_start', event_data)
     
     def _emit_stream_end(self, connection_type: str, connection_id: str,
@@ -2088,6 +2095,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             target_slots=target_slots or None,
             routing_cached=True,
         )
+        heard_on = self._peer_channel(cache_repeater_id)
+        self._stamp_channel(new_stream, heard_on)
 
         # Populate the user cache — data calls are as good a locator as
         # voice. If a radio beacons APRS from repeater X now, a unit voice
@@ -2102,7 +2111,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 talkgroup=dst_int,
                 outbound_name=cache_outbound_name,
                 source='data',
-                **self._peer_channel(cache_repeater_id),
+                **heard_on,
             )
 
         return new_stream
@@ -2137,6 +2146,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             self._emit_stream_start(
                 'repeater', rid_int, slot, rf_src, dst_id, stream_id,
                 emit_call_type, False, is_data=True,
+                heard_on=self._peer_channel(rid_int),
             )
             return True
 
@@ -2311,7 +2321,9 @@ class HBProtocol(asyncio.DatagramProtocol):
             target_repeaters=target_repeaters,
             routing_cached=True
         )
-        
+        heard_on = self._peer_channel(rid_to_int(repeater.repeater_id))
+        self._stamp_channel(new_stream, heard_on)
+
         repeater.set_slot_stream(slot, new_stream)
         
         # Log stream start with fast talkgroup switch indicator and target count
@@ -2332,7 +2344,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             dst_id, 
             stream_id,
             new_stream.call_type,
-            False  # RX stream, not assumed
+            False,  # RX stream, not assumed
+            heard_on=heard_on,
         )
         
         # Update user cache (for "last heard" and private call routing)
@@ -2346,7 +2359,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 callsign='',  # Callsign lookup handled by dashboard
                 slot=slot,
                 talkgroup=dst,
-                **self._peer_channel(repeater_id),
+                **heard_on,
             )
 
         return True
@@ -2454,6 +2467,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             is_broadcast_unit_call=is_broadcast,
             target_slots=target_slots or None,
         )
+        heard_on = self._peer_channel(rid_int)
+        self._stamp_channel(new_stream, heard_on)
         repeater.set_slot_stream(slot, new_stream)
 
         # Start-of-stream line mirrors the group-call format but with TS/RID in
@@ -2488,6 +2503,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             stream_id,
             'private',
             False,
+            heard_on=heard_on,
         )
 
         # Populate user cache for the source radio. Same call shape as the
@@ -2501,18 +2517,27 @@ class HBProtocol(asyncio.DatagramProtocol):
                 callsign='',
                 slot=slot,
                 talkgroup=dst_int,
-                **self._peer_channel(rid_int),
+                **heard_on,
             )
 
         return True
 
-    def _peer_channel(self, repeater_id: int) -> Dict[str, Optional[int]]:
-        """The frequency (Hz, from RPTC/DMRC RX freq) and color code a local
-        peer reported, as user-cache kwargs. Empty values for unknown peers."""
+    def _peer_channel(self, repeater_id: int) -> Dict[str, Any]:
+        """Where a local peer is hearing right now, as user-cache kwargs: the
+        frequency (Hz, from RPTC/DMRC RX freq) and color code it last reported,
+        and its location (RPTC, or DMRC's optional tail). A roaming peer sends
+        DMRC just before a stream heard on a new channel, so at a stream's start
+        this is where that stream came from. Empty values for unknown peers."""
         repeater = self._repeaters.get(repeater_id.to_bytes(4, 'big')) if repeater_id else None
         if repeater is None:
-            return {'freq': None, 'colorcode': None}
-        return {'freq': parse_freq_hz(repeater.rx_freq), 'colorcode': parse_colorcode(repeater.colorcode)}
+            return {'freq': None, 'colorcode': None, 'latitude': None, 'longitude': None, 'height': None}
+        lat, lon, height = parse_location(repeater.latitude, repeater.longitude, repeater.height)
+        return {'freq': parse_freq_hz(repeater.rx_freq), 'colorcode': parse_colorcode(repeater.colorcode),
+                'latitude': lat, 'longitude': lon, 'height': height}
+
+    def _stamp_channel(self, stream: StreamState, channel: Dict[str, Any]) -> None:
+        """Record on a received stream the channel it was heard on (see StreamState.freq)."""
+        stream.freq, stream.colorcode = channel['freq'], channel['colorcode']
 
     def _unit_target_ok(self, repeater: RepeaterState, slot: int, stream_id: bytes,
                         rf_src: bytes, dst_id: bytes) -> bool:
@@ -2625,17 +2650,22 @@ class HBProtocol(asyncio.DatagramProtocol):
         return None
 
     def _channel_busy(self, freq: int) -> bool:
-        """Is anything being heard or sent on `freq` right now? Any peer on that
-        frequency — receive-only ones included — with a stream in progress."""
+        """Is anything being heard or sent on `freq` right now? Any peer —
+        receive-only ones included — with a stream in progress on it: a received
+        stream where it was heard (a roamer may have retuned since), one we're
+        sending on the peer's channel."""
         for r in self._repeaters.values():
             if r.connection_state != 'connected':
                 continue
-            if not (freqs_match(freq, parse_freq_hz(r.rx_freq))
-                    or freqs_match(freq, parse_freq_hz(r.tx_freq))):
-                continue
             for s in (1, 2):
                 stream = r.get_slot_stream(s)
-                if stream is not None and not stream.ended:
+                if stream is None or stream.ended:
+                    continue
+                if stream.freq is not None:
+                    if freqs_match(freq, stream.freq):
+                        return True
+                elif (freqs_match(freq, parse_freq_hz(r.rx_freq))
+                      or freqs_match(freq, parse_freq_hz(r.tx_freq))):
                     return True
         return False
 
@@ -2807,8 +2837,11 @@ class HBProtocol(asyncio.DatagramProtocol):
             call = self._roaming_calls.get(stream_id)
             if call is not None and call.roamer == repeater_id:
                 del self._roaming_calls[stream_id]
-            repeater.rx_freq = repeater.tx_freq = str(freq).encode()
-            repeater.colorcode = str(cc).encode()
+            channel = (b'%09u' % freq, b'%02u' % cc)          # as DMRC writes them
+            if (repeater.rx_freq, repeater.tx_freq, repeater.colorcode) != (channel[0], channel[0], channel[1]):
+                repeater.rx_freq = repeater.tx_freq = channel[0]
+                repeater.colorcode = channel[1]
+                self._events.emit('repeater_channel', self._repeater_channel_event(repeater_id, repeater))
             LOGGER.info(f'Roaming transceiver {rid_int} on air at {freq / 1e6:.5f} MHz CC{cc} '
                         f'for stream {stream_id.hex()}')
             self._events.emit('roaming_on_air', {'repeater_id': rid_int, 'stream_id': stream_id.hex(),
@@ -3194,6 +3227,20 @@ class HBProtocol(asyncio.DatagramProtocol):
             if 'repeater_id' in locals():
                 self._send_nak(repeater_id, addr)
 
+    @staticmethod
+    def _parse_dmrc_location(repeater: RepeaterState, data: bytes) -> None:
+        """DMRC's optional tail (HBlink4 extension), after the 119-byte packet,
+        in RPTC's field widths: [119:127] latitude, [127:136] longitude,
+        [136:139] antenna height above ground (m). Absent: left as it was."""
+        if len(data) >= 139:
+            repeater.latitude, repeater.longitude, repeater.height = data[119:127], data[127:136], data[136:139]
+
+    def _repeater_channel_event(self, repeater_id: bytes, repeater: RepeaterState) -> Dict[str, Any]:
+        lat, lon, height = parse_location(repeater.latitude, repeater.longitude, repeater.height)
+        return {'repeater_id': rid_to_int(repeater_id), 'rx_freq': repeater.get_rx_freq_str(),
+                'tx_freq': repeater.get_tx_freq_str(), 'colorcode': repeater.get_colorcode_str(),
+                'latitude': lat, 'longitude': lon, 'height': height}
+
     def _handle_dmrc(self, repeater_id: bytes, data: bytes, addr: PeerAddress) -> None:
         """Handle DMRC (MMDVMHost protocol variant).
 
@@ -3213,6 +3260,7 @@ class HBProtocol(asyncio.DatagramProtocol):
           [38:39] Slots ('0'-'4')
           [39:79] Software/Version (40 chars, space-padded)
           [79:119] Hardware/Package (40 chars, space-padded)
+        Optional tail (HBlink4 extension, 139 bytes): see _parse_dmrc_location.
         """
         ip, port = addr[0], addr[1]
 
@@ -3229,10 +3277,18 @@ class HBProtocol(asyncio.DatagramProtocol):
                                 f'{repeater.ip}:{repeater.port} → {ip}:{port}')
                     repeater.ip, repeater.port = ip, port
                     self._init_repeater_send(repeater, addr)
+                before = (repeater.rx_freq, repeater.tx_freq, repeater.colorcode,
+                          repeater.latitude, repeater.longitude, repeater.height)
                 if repeater.roaming and len(data) >= 119:
-                    # A roaming transceiver's keepalive says where it's tuned now.
+                    # A roaming transceiver's DMRC says where it's tuned now. It
+                    # sends one right before a stream heard on a new channel, so
+                    # the stream is credited to that channel.
                     repeater.rx_freq, repeater.tx_freq = data[16:25], data[25:34]
                     repeater.colorcode = data[36:38]
+                self._parse_dmrc_location(repeater, data)
+                if before != (repeater.rx_freq, repeater.tx_freq, repeater.colorcode,
+                              repeater.latitude, repeater.longitude, repeater.height):
+                    self._events.emit('repeater_channel', self._repeater_channel_event(repeater_id, repeater))
                 repeater.last_ping = time()
                 if repeater.missed_pings > 0:
                     repeater.missed_pings = 0
@@ -3290,6 +3346,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 repeater.slots = data[38:39]
                 repeater.software_id = data[39:79]
                 repeater.package_id = data[79:119]
+                self._parse_dmrc_location(repeater, data)
             elif len(data) >= 16:
                 repeater.callsign = data[8:16]
 

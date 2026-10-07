@@ -48,6 +48,11 @@ class UserEntry:
     freq: Optional[int] = None
     colorcode: Optional[int] = None
     source: str = 'voice'
+    # Where the peer that heard it is (its RPTC / DMRC location), when it says:
+    # degrees, and antenna height above ground in meters.
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    height: Optional[int] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization"""
@@ -63,6 +68,9 @@ class UserEntry:
             'freq': self.freq,
             'colorcode': self.colorcode,
             'source': self.source,
+            'latitude': self.latitude,
+            'longitude': self.longitude,
+            'height': self.height,
         }
 
 
@@ -94,7 +102,8 @@ class UserCache:
                slot: int, talkgroup: int, talker_alias: Optional[str] = None,
                outbound_name: Optional[str] = None, freq: Optional[int] = None,
                colorcode: Optional[int] = None, source: str = 'voice',
-               heard_at: Optional[float] = None) -> bool:
+               heard_at: Optional[float] = None, latitude: Optional[float] = None,
+               longitude: Optional[float] = None, height: Optional[int] = None) -> bool:
         """
         Update cache with user activity.
 
@@ -114,6 +123,7 @@ class UserCache:
             source: What reported it (see UserEntry.source)
             heard_at: When it was heard, for reports from elsewhere; an entry
                 already newer than this is kept. Defaults to now.
+            latitude, longitude, height: Where the peer that heard it is, if known
 
         Returns:
             False if the update was ignored as older than the cached entry.
@@ -135,6 +145,7 @@ class UserCache:
             entry.freq = freq
             entry.colorcode = colorcode
             entry.source = source
+            entry.latitude, entry.longitude, entry.height = latitude, longitude, height
             if talker_alias:
                 entry.talker_alias = talker_alias
             LOGGER.debug(f'Updated cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
@@ -151,6 +162,9 @@ class UserCache:
                 freq=freq,
                 colorcode=colorcode,
                 source=source,
+                latitude=latitude,
+                longitude=longitude,
+                height=height,
             )
             LOGGER.debug(f'Added to cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
         return True

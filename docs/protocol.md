@@ -257,6 +257,31 @@ on now. Two packets are added:
 
 DMRD for a stream with no DMRT is dropped by the transceiver.
 
+**Where a stream was heard.** Each stream a peer sends is credited to the
+channel the peer reported last before it started: its RPTC / DMRC RX frequency
+and color code. A roaming transceiver that retunes to *receive* (e.g. one that
+scans) sends a DMRC right before the first DMRD of a stream heard on a channel
+it hasn't reported yet, so HBlink4 records that channel for the stream and the
+radio's last-heard entry, and keeps it after the transceiver moves on. The
+channel counts as busy while that stream is open, wherever the transceiver is
+by then. `stream_start` events carry `freq` (Hz), `colorcode`, and the peer's
+`latitude` / `longitude` / `height`; so do last-heard entries.
+
+### DMRC location tail (HBlink4 extension)
+
+MMDVMHost's DMRC (119 bytes) has no location. A peer may append RPTC's three
+location fields, making it 139 bytes:
+```
+[119:127] latitude, degrees (8 chars ASCII, e.g. '39.1031 ')
+[127:136] longitude, degrees (9 chars ASCII, e.g. '-84.5120 ')
+[136:139] antenna height above ground, meters (3 chars ASCII, e.g. '012')
+```
+TX power is already at `[34:36]`. A plain 119-byte DMRC leaves the stored
+location as it was, so the tail can be sent at registration only or on every
+DMRC (a gateway that moves). 0 / 0 means not configured, as in RPTC. A change of
+a peer's channel or location emits `repeater_channel` (`repeater_id`,
+`rx_freq`, `tx_freq`, `colorcode`, `latitude`, `longitude`, `height`).
+
 ## Connection Flow
 
 1. **Initial Connection**

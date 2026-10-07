@@ -96,6 +96,12 @@ class StreamState:
     is_assumed: bool = False  # True if this is an assumed stream (forwarded to target, not received from it)
     target_repeaters: Optional[set] = None  # Cached set of repeater_ids approved for forwarding
     routing_cached: bool = False  # True once routing has been calculated
+    # Where a stream received from a peer was heard: that peer's frequency (Hz)
+    # and color code when it started. A roaming peer sends DMRC right before a
+    # stream heard on a new channel, so this is the channel the call was on even
+    # after the peer retunes. None for streams we send (assumed) or unknown.
+    freq: Optional[int] = None
+    colorcode: Optional[int] = None
 
     # Unit-call metadata. `is_unit_call` is True when this stream carries a
     # private (subscriber-to-subscriber) call; `dst_id` holds the target radio
@@ -320,9 +326,6 @@ class RepeaterState:
     # Cached decoded strings (for efficiency - decode once, use many times)
     _callsign_str: str = field(default='', init=False, repr=False)
     _location_str: str = field(default='', init=False, repr=False)
-    _rx_freq_str: str = field(default='', init=False, repr=False)
-    _tx_freq_str: str = field(default='', init=False, repr=False)
-    _colorcode_str: str = field(default='', init=False, repr=False)
     
     @property
     def sockaddr(self) -> PeerAddress:
@@ -342,22 +345,16 @@ class RepeaterState:
         return self._location_str or 'Unknown'
     
     def get_rx_freq_str(self) -> str:
-        """Get decoded RX frequency string (cached)"""
-        if not self._rx_freq_str and self.rx_freq:
-            self._rx_freq_str = safe_decode_bytes(self.rx_freq)
-        return self._rx_freq_str
+        """Get decoded RX frequency string (not cached: a roaming peer's changes)"""
+        return safe_decode_bytes(self.rx_freq) if self.rx_freq else ''
     
     def get_tx_freq_str(self) -> str:
-        """Get decoded TX frequency string (cached)"""
-        if not self._tx_freq_str and self.tx_freq:
-            self._tx_freq_str = safe_decode_bytes(self.tx_freq)
-        return self._tx_freq_str
+        """Get decoded TX frequency string (not cached: a roaming peer's changes)"""
+        return safe_decode_bytes(self.tx_freq) if self.tx_freq else ''
     
     def get_colorcode_str(self) -> str:
-        """Get decoded color code string (cached)"""
-        if not self._colorcode_str and self.colorcode:
-            self._colorcode_str = safe_decode_bytes(self.colorcode)
-        return self._colorcode_str
+        """Get decoded color code string (not cached: a roaming peer's changes)"""
+        return safe_decode_bytes(self.colorcode) if self.colorcode else ''
     
     def get_slot_stream(self, slot: int) -> Optional[StreamState]:
         """Get the active stream for a given slot"""

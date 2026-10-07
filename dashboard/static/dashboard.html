@@ -2241,6 +2241,22 @@
                     }
                     break;
                 
+                case 'repeater_channel':
+                    // A roaming peer retuned, or a peer's location changed
+                    if (state.repeaters && data.repeater_id) {
+                        const list = Array.isArray(state.repeaters) ? state.repeaters : Object.values(state.repeaters);
+                        const r = list.find(r => r.repeater_id == data.repeater_id);
+                        if (r) {
+                            Object.assign(r, data);
+                            updateRepeaters(state.repeaters);
+                        }
+                    }
+                    if (state.repeater_details && state.repeater_details[data.repeater_id]) {
+                        const d = state.repeater_details[data.repeater_id];
+                        d.latitude = data.latitude; d.longitude = data.longitude; d.height = data.height;
+                    }
+                    break;
+
                 case 'repeater_details':
                     // Store detailed repeater information (sent once on connection)
                     if (data.repeater_id) {
