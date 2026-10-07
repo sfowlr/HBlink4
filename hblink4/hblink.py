@@ -2398,11 +2398,12 @@ class HBProtocol(asyncio.DatagramProtocol):
 
         # Gate at the source: repeater must be enabled for unit calls.
         if not repeater.unit_calls_enabled:
-            LOGGER.info(
-                f'UNIT CALL rejected on repeater {rid_int} TS{slot}: '
-                f'src={src_int} → dst={dst_int} stream_id={stream_id.hex()} '
-                f'[repeater has unit_calls_enabled=False]'
-            )
+            self._log_unit_rejection(stream_id, logging.INFO,
+                f'UNIT CALL rejected on repeater {rid_int} ({repeater.get_callsign_str()}) TS{slot}: '
+                f'src={src_int} → dst={dst_int} stream_id={stream_id.hex()}{self._heard_where(rid_int)} '
+                f'[unit calls not enabled for this peer'
+                + ('; receive-only' if not repeater.tx_capable else '') + ']'
+                + self._echo_note(rf_src, dst_id, repeater.repeater_id))
             self._unit_call_status(stream_id, src_int, dst_int, 'failed', 'unit calls not enabled')
             return False
 
@@ -2427,29 +2428,31 @@ class HBProtocol(asyncio.DatagramProtocol):
                     )
                     same_src = (current_stream.rf_src == rf_src)
                     if not (same_pair or same_src):
-                        LOGGER.warning(
+                        self._log_unit_rejection(stream_id, logging.WARNING,
                             f'UNIT CALL hang-time hijack blocked on repeater {rid_int} TS{slot}: '
                             f'slot reserved for {bytes_to_int(current_stream.rf_src)}↔'
                             f'{bytes_to_int(current_stream.dst_id)}, '
-                            f'denied src={src_int} → dst={dst_int}'
+                            f'denied src={src_int} → dst={dst_int} stream_id={stream_id.hex()}'
                         )
                         self._unit_call_status(stream_id, src_int, dst_int, 'failed', 'slot in hang time')
                         return False
                 else:
                     # Prior stream was a group call; only same source can break through
                     if current_stream.rf_src != rf_src:
-                        LOGGER.warning(
+                        self._log_unit_rejection(stream_id, logging.WARNING,
                             f'UNIT CALL hang-time hijack blocked on repeater {rid_int} TS{slot}: '
-                            f'slot in group-call hang time, denied src={src_int} → dst={dst_int}'
+                            f'slot in group-call hang time, denied src={src_int} → dst={dst_int} '
+                            f'stream_id={stream_id.hex()}'
                         )
                         self._unit_call_status(stream_id, src_int, dst_int, 'failed', 'slot in hang time')
                         return False
                 # fall through to create new stream
             else:
                 # Active stream on this slot — contention, first come wins.
-                LOGGER.warning(
+                self._log_unit_rejection(stream_id, logging.WARNING,
                     f'UNIT CALL contention on repeater {rid_int} TS{slot}: '
                     f'existing stream_id={current_stream.stream_id.hex()} '
+                    f'(src={bytes_to_int(current_stream.rf_src)} → dst={bytes_to_int(current_stream.dst_id)}) '
                     f'vs new src={src_int} → dst={dst_int} stream_id={stream_id.hex()}'
                 )
                 return False
@@ -2536,6 +2539,36 @@ class HBProtocol(asyncio.DatagramProtocol):
             )
 
         return True
+
+    def _log_unit_rejection(self, stream_id: bytes, level: int, message: str) -> None:
+        """Log why a unit-call stream was refused, once per stream (it's refused at every packet)."""
+        key = (b'rej', stream_id)
+        if key in self._unit_status:
+            return
+        self._unit_status[key] = 'rejected'
+        while len(self._unit_status) > 512:
+            self._unit_status.popitem(last=False)
+        LOGGER.log(level, message)
+
+    def _heard_where(self, rid_int: int) -> str:
+        ch = self._peer_channel(rid_int)
+        if ch['freq'] is None:
+            return ''
+        return f' heard at {ch["freq"] / 1e6:.5f} MHz' + (f' CC{ch["colorcode"]}' if ch['colorcode'] is not None else '')
+
+    def _echo_note(self, rf_src: bytes, dst_id: bytes, heard_by: bytes) -> str:
+        """' — our own call, being sent via <peer>' when we're sending this src → dst
+        right now elsewhere: a receiver hearing that transmission (harmless)."""
+        for r in self._repeaters.values():
+            if r.repeater_id == heard_by:
+                continue
+            for s in (1, 2):
+                st = r.get_slot_stream(s)
+                if st is not None and st.is_assumed and not st.ended and st.rf_src == rf_src and st.dst_id == dst_id:
+                    where = f' at {parse_freq_hz(r.tx_freq) / 1e6:.5f} MHz' if parse_freq_hz(r.tx_freq) else ''
+                    return (f' — our own call, being sent via {rid_to_int(r.repeater_id)} '
+                            f'({r.get_callsign_str()}){where}: this peer hears it')
+        return ''
 
     def _unit_call_status(self, stream_id: bytes, src: int, dst: int, status: str,
                           reason: Optional[str] = None, **extra: Any) -> None:

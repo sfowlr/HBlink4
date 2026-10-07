@@ -112,3 +112,20 @@ def test_each_status_once_and_nothing_on_mqtt_without_a_topic():
         hb._handle_unit_stream_start(console, sid(CONSOLE_RADIO), sid(RADIO), 1, STREAM)
     assert statuses(hb) == [(STREAM.hex(), 'failed', 'unit calls not enabled')]
     assert hb._external_last_heard.published == []                   # no status_topic configured
+
+
+def test_a_refused_stream_is_logged_once_and_says_why(caplog):
+    """2026-10-07: an SDR hearing the roamer send Brian's answer logged ~60 identical
+    'UNIT CALL rejected' lines per call."""
+    import logging
+    hb = setup()
+    r = roamer(hb, ROAM1, freq=SIMPLEX)
+    r.set_slot_stream(2, StreamState(repeater_id=rid(ROAM1), rf_src=sid(CONSOLE_RADIO), dst_id=sid(RADIO),
+                                     slot=2, start_time=0, last_seen=0, stream_id=STREAM, is_assumed=True))
+    sdr = hb._repeaters[rid(SDR1)]                   # receive-only, unit calls off, on 461.6875
+    with caplog.at_level(logging.INFO, logger=hblink.LOGGER.name):
+        for _ in range(5):
+            hb._handle_unit_stream_start(sdr, sid(CONSOLE_RADIO), sid(RADIO), 1, b'\x0e' * 4)
+    [line] = [m for m in caplog.messages if 'UNIT CALL rejected' in m]
+    assert f'repeater {SDR1}' in line and 'heard at 461.68750 MHz CC1' in line and 'receive-only' in line
+    assert f'our own call, being sent via {ROAM1}' in line and f'{SIMPLEX / 1e6:.5f} MHz' in line
