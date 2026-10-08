@@ -27,7 +27,9 @@ list of them:
      "latitude": 43.03,            where the receiver is (degrees); optional. Unit
      "longitude": -77.72}          calls go out only at the radio's site: by `site`
                                    when both sides have one, else within
-                                   global.site_radius_km of this
+                                   global.site_radius_km of this. Neither: the
+                                   place already known for the radio on this
+                                   channel is kept
 
 Needs paho-mqtt (>=2.0), imported only when the feed is enabled. paho's
 network thread hands each message to the asyncio loop, so the user cache is
@@ -41,9 +43,9 @@ from time import time
 from typing import Any, Dict, Optional
 
 try:
-    from .utils import parse_freq_hz, parse_colorcode, parse_location
+    from .utils import parse_freq_hz, parse_colorcode, parse_location, freqs_match
 except ImportError:
-    from utils import parse_freq_hz, parse_colorcode, parse_location
+    from utils import parse_freq_hz, parse_colorcode, parse_location, freqs_match
 
 LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +96,13 @@ class ExternalLastHeard:
         source = str(report.get('source') or 'external')[:16]
         lat, lon, height = parse_location(report.get('latitude'), report.get('longitude'), report.get('height'))
         site = str(report['site'])[:32] if report.get('site') else None
+        if site is None and lat is None:
+            # No place given: keep the one we have for the radio on this channel
+            # (heard here, on a peer whose pattern names its site), e.g. when the
+            # reporter's receiver doesn't know where it is.
+            known = self._cache.lookup(radio_id)
+            if known is not None and freqs_match(known.freq, freq):
+                site, lat, lon, height = known.site, known.latitude, known.longitude, known.height
         if self._cache.update(radio_id=radio_id, repeater_id=0, callsign='', slot=slot, talkgroup=0,
                               freq=freq, colorcode=parse_colorcode(report.get('colorcode')),
                               source=f'{source}-ext', heard_at=at,

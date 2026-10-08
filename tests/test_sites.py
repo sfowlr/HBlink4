@@ -161,6 +161,21 @@ def test_an_external_report_places_the_radio_by_location():
         assert route(hb, stream=b'\x05' * 4)[0] == {rid(ROAM_AL)}
 
 
+def test_a_report_without_a_place_keeps_the_one_known_for_that_channel():
+    hb = make_hb()
+    sdr(hb, SDR_NY, CH15, site='ny')
+    roamer(hb, ROAM_AL, site='al')
+    roamer(hb, ROAM_NY, site='ny')
+    heard_by(hb, RADIO, SDR_NY)
+    feed = ExternalLastHeard(hb._user_cache)
+    feed.handle('t', json.dumps({'radio_id': RADIO, 'freq': CH15, 'colorcode': 2}).encode())
+    assert (hb._user_cache.lookup(RADIO).site, hb._user_cache.lookup(RADIO).source) == ('ny', 'external-ext')
+    with patch.dict(hblink.CONFIG, CONFIG):
+        assert route(hb)[0] == {rid(ROAM_NY)}
+    feed.handle('t', json.dumps({'radio_id': RADIO, 'freq': CH1, 'colorcode': 2}).encode())
+    assert hb._user_cache.lookup(RADIO).site is None                 # another channel: place unknown
+
+
 # ---- group calls ----
 
 def group_call(hb, n, dst=201, src=TALKER, stream=b'\xaa\xbb\xcc\xdd'):
