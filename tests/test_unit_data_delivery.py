@@ -267,12 +267,13 @@ def test_a_busy_slot_waits_for_room_without_using_an_attempt():
         call = busy(hb, clock)
         feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
         poll(hb, clock, 30)                                      # a long call: nothing sent, nothing final
-        assert modem.sent == [] and outcomes(hb) == []
+        assert modem.sent == [] and outcomes(hb) == [('waiting', 'slot busy', None)]
+        assert last(hb)['busy_wait_s'] == 120.0
         call.ended, call.end_time = True, clock.t                # it ends; then its hang time (3 s)
         poll(hb, clock, 2.5)
         assert modem.sent == []
         poll(hb, clock, 1.0)
-        assert len(modem.sent) == 6 and outcomes(hb) == [('routed', None, None)]   # still the first attempt
+        assert len(modem.sent) == 6 and outcomes(hb)[-1] == ('routed', None, None)   # still the first attempt
         clock.t += 5.1
         hb._check_unit_data()                                    # no response: the one retry, 10 s on
         poll(hb, clock, 10)
@@ -290,7 +291,7 @@ def test_a_retry_that_finds_the_slot_busy_waits_too():
         hb._check_unit_data()                                    # no response
         call = busy(hb, clock)                                   # and now the radio's slot is taken
         poll(hb, clock, 40)
-        assert len(modem.sent) == 6 and outcomes(hb) == [('routed', None, None)]
+        assert len(modem.sent) == 6 and outcomes(hb) == [('routed', None, None), ('waiting', 'slot busy', 2)]
         call.ended, call.end_time = True, clock.t
         poll(hb, clock, 3.5)
         assert len(modem.sent) == 12 and outcomes(hb)[-1] == ('routed', None, 2)
@@ -302,9 +303,9 @@ def test_a_slot_busy_past_busy_wait_s_fails():
         busy(hb, clock)
         feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
         poll(hb, clock, 119)
-        assert outcomes(hb) == []
+        assert outcomes(hb) == [('waiting', 'slot busy', None)]
         poll(hb, clock, 2)
-    assert outcomes(hb) == [('failed', 'slot busy for 120 s', None)]
+    assert outcomes(hb)[-1] == ('failed', 'slot busy for 120 s', None)
     assert hb._repeaters[rid(MODEM1)].sent == []
 
 
@@ -316,7 +317,7 @@ def test_a_newer_packet_replaces_one_waiting_for_room():
         feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
         poll(hb, clock, 4)
         feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3, ns=4), stream=0x5EED0002))  # the sender's own retry
-        assert outcomes(hb) == [('no_response', 'superseded by a newer packet', None)]
+        assert outcomes(hb)[-1] == ('no_response', 'superseded by a newer packet', None)
         call.ended, call.end_time = True, clock.t
         poll(hb, clock, 3.5)
     assert len(modem.sent) == 6                                  # only the newer one goes out

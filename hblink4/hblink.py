@@ -2626,7 +2626,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         """Report what became of a unit call: 'routed' (forwarded to a fixed
         peer or outbound, or broadcast), 'on_air' (a roaming transceiver is
         sending it) or 'failed' (with `reason`); for a unit data packet also
-        'delivered', 'nacked' or 'no_response' (unit_data.py). An event, and on MQTT at
+        'delivered', 'nacked' or 'no_response', and 'waiting' while it's held for a
+        busy destination (unit_data.py). An event, and on MQTT at
         `{external_last_heard.status_topic}/{src}` so the caller (e.g. a bot)
         can send it again. Each status once per stream (once per attempt, for
         a unit data packet HBlink4 sends again: see unit_data.py)."""
@@ -2783,6 +2784,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 rec.busy_since = now
                 LOGGER.info(f'Unit data {rec.stream_id.hex()} to {bytes_to_int(rec.dst_id)}: {reason}, '
                             f'waiting up to {cfg["busy_wait_s"]:g} s to send it')
+                self._unit_call_status(rec.current_sid, bytes_to_int(rec.rf_src), bytes_to_int(rec.dst_id),
+                                       'waiting', reason, busy_wait_s=cfg['busy_wait_s'])
             if now - rec.busy_since < cfg['busy_wait_s']:
                 rec.deadline, rec.retry_at, rec.busy_retry = None, now + BUSY_POLL_S, True
                 return
