@@ -92,7 +92,7 @@ try:
         decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
         classify_lc_carrier,
         STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
-        dtype_name, decode_data_header, decode_bptc_block,
+        dtype_name, decode_data_header, decode_bptc_block, is_single_csbk,
     )
     from .unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS, \
         BUSY_REASONS, BUSY_POLL_S
@@ -127,7 +127,7 @@ except ImportError:
         decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
         classify_lc_carrier,
         STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
-        dtype_name, decode_data_header, decode_bptc_block,
+        dtype_name, decode_data_header, decode_bptc_block, is_single_csbk,
     )
     from unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS, \
         BUSY_REASONS, BUSY_POLL_S
@@ -4905,10 +4905,14 @@ class HBProtocol(asyncio.DatagramProtocol):
         """Count a data stream's blocks against its data header's
         blocks-to-follow; True when this frame completes the transaction.
         Only response, unconfirmed and confirmed data headers are counted (a
-        proprietary second header counts as one of their blocks)."""
+        proprietary second header counts as one of their blocks). A CSBK that
+        isn't a preamble (a radio check, call alert …: lc.is_single_csbk) is a
+        transaction of its own when it starts the stream: done at once."""
         if frame_type != 2:
             return False
         if stream.data_blocks_left is None:
+            if dtype_vseq == 3 and stream.packet_count <= 1 and is_single_csbk(payload):
+                return True
             if dtype_vseq != 6:
                 return False
             header = decode_data_header(payload)

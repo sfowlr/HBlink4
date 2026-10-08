@@ -308,6 +308,33 @@ def decode_bptc_block(payload: bytes) -> Optional[bytes]:
     return _decode_bptc_96(payload)
 
 
+CSBK_PREAMBLE = 0x3D
+CSBK_CRC_MASK = 0xA5A5
+
+
+def crc16_ccitt(data: bytes) -> int:
+    """The CRC-CCITT of DMR headers and CSBKs (ETSI TS 102 361-1 B.3.7), before its mask."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else (crc << 1)
+            crc &= 0xFFFF
+    return crc ^ 0xFFFF
+
+
+def is_single_csbk(payload: bytes) -> bool:
+    """True for a CSBK that is a whole transaction on its own: one that decodes
+    with a good CRC and isn't a preamble CSBK (opcode 0x3D, which announces a
+    data header and blocks to follow). A radio check, call alert, emergency
+    alarm or their answers are one burst with no header or terminator. Octet 0:
+    last block, protect flag, opcode (6 bits); octets 10-11: the CRC, masked."""
+    raw = _decode_bptc_96(payload)
+    if raw is None or len(raw) < 12 or (raw[0] & 0x3F) == CSBK_PREAMBLE:
+        return False
+    return crc16_ccitt(raw[:10]) ^ CSBK_CRC_MASK == int.from_bytes(raw[10:12], 'big')
+
+
 def decode_data_header(payload: bytes) -> Optional[Dict[str, object]]:
     """Extract identifying fields from a DMR Data Header payload.
 
