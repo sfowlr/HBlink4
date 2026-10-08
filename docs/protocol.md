@@ -282,6 +282,14 @@ DMRC (a gateway that moves). 0 / 0 means not configured, as in RPTC. A change of
 a peer's channel or location emits `repeater_channel` (`repeater_id`,
 `rx_freq`, `tx_freq`, `colorcode`, `latitude`, `longitude`, `height`).
 
+A roaming transceiver may go on with its idle channel (the one it listens on
+between calls), making it 150 bytes; send a 0 / 0 location if it has none:
+```
+[139:148] idle frequency, Hz (9 digits ASCII)
+[148:150] idle color code (2 digits ASCII)
+```
+`roaming_group_calls: "idle"` uses it.
+
 ## Connection Flow
 
 1. **Initial Connection**

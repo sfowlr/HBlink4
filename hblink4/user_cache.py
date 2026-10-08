@@ -53,6 +53,9 @@ class UserEntry:
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     height: Optional[int] = None
+    # The heard-on peer's site (its pattern's `site`), or the site an external
+    # report names. Unit calls to the radio go out only at this site.
+    site: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization"""
@@ -71,6 +74,7 @@ class UserEntry:
             'latitude': self.latitude,
             'longitude': self.longitude,
             'height': self.height,
+            'site': self.site,
         }
 
 
@@ -103,7 +107,8 @@ class UserCache:
                outbound_name: Optional[str] = None, freq: Optional[int] = None,
                colorcode: Optional[int] = None, source: str = 'voice',
                heard_at: Optional[float] = None, latitude: Optional[float] = None,
-               longitude: Optional[float] = None, height: Optional[int] = None) -> bool:
+               longitude: Optional[float] = None, height: Optional[int] = None,
+               site: Optional[str] = None) -> bool:
         """
         Update cache with user activity.
 
@@ -124,6 +129,7 @@ class UserCache:
             heard_at: When it was heard, for reports from elsewhere; an entry
                 already newer than this is kept. Defaults to now.
             latitude, longitude, height: Where the peer that heard it is, if known
+            site: That peer's site, if it has one
 
         Returns:
             False if the update was ignored as older than the cached entry.
@@ -146,6 +152,7 @@ class UserCache:
             entry.colorcode = colorcode
             entry.source = source
             entry.latitude, entry.longitude, entry.height = latitude, longitude, height
+            entry.site = site
             if talker_alias:
                 entry.talker_alias = talker_alias
             LOGGER.debug(f'Updated cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
@@ -165,6 +172,7 @@ class UserCache:
                 latitude=latitude,
                 longitude=longitude,
                 height=height,
+                site=site,
             )
             LOGGER.debug(f'Added to cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
         return True

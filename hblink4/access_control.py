@@ -73,8 +73,9 @@ class RepeaterConfig:
     # never routed to them.
     tx: bool = True
     # A roaming transceiver: one simplex radio HBlink4 retunes per call (DMRT)
-    # to reach radios on channels no fixed peer transmits on. Never gets group
-    # traffic; used for a unit call only when no fixed TX peer is on the channel.
+    # to reach radios on channels no fixed peer transmits on. Used for a unit
+    # call only when no fixed TX peer is on the channel; for group calls heard
+    # at other sites only as `roaming_group_calls` allows.
     roaming: bool = False
     # Roaming transceivers only. Picking one for a call: one already idling on
     # the channel first; then lower `roaming_priority`, equal ones taking turns
@@ -83,14 +84,27 @@ class RepeaterConfig:
     # other roamer is free) or "as_needed"; None = global.roaming_interrupt_rx.
     roaming_priority: int = 100
     roaming_interrupt_rx: Optional[str] = None
+    # Where the peer is, for unit calls on networks spread over several places
+    # that share a channel plan: a call goes out only at the site where the
+    # target radio was heard. Any name; peers in one place share it. Without
+    # it, the peer's location (RPTC / DMRC) and global.site_radius_km decide.
+    site: Optional[str] = None
+    # Roaming transceivers only: may it carry group calls to its site, heard at
+    # another — "all" (any channel in roaming_channels), "idle" (only its idle
+    # channel, which its DMRC reports) or "none"; None = global.roaming_group_calls.
+    roaming_group_calls: Optional[str] = None
 
     def __post_init__(self):
         if self.roaming_interrupt_rx not in (None,) + ROAMING_INTERRUPT_MODES:
             raise ValueError(f"roaming_interrupt_rx must be one of {ROAMING_INTERRUPT_MODES}, "
                              f"not {self.roaming_interrupt_rx!r}")
+        if self.roaming_group_calls not in (None,) + ROAMING_GROUP_MODES:
+            raise ValueError(f"roaming_group_calls must be one of {ROAMING_GROUP_MODES}, "
+                             f"not {self.roaming_group_calls!r}")
 
 
 ROAMING_INTERRUPT_MODES = ('never', 'last_resort', 'as_needed')
+ROAMING_GROUP_MODES = ('all', 'idle', 'none')
 
 @dataclass
 class PatternMatch:

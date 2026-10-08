@@ -299,6 +299,12 @@ class RepeaterState:
     roaming_last_used: int = 0                   # turn number of the last call it was sent (turn-taking)
     roaming_cooldown_until: float = 0.0          # skipped until then (radio error / no answer)
 
+    roaming_group_calls: Optional[str] = None    # None: global.roaming_group_calls
+    roaming_idle: Optional[Tuple[int, Optional[int]]] = None   # (Hz, color code) from its DMRC
+
+    # The matched pattern's `site` (see RepeaterConfig.site), or None.
+    site: Optional[str] = None
+
     # DMRD translation maps (inverses of each other; empty = no translation).
     # inbound_map:  local (slot,tgid) → network (slot,tgid) — applied when this
     #               repeater SENDS us traffic, converting its local addressing

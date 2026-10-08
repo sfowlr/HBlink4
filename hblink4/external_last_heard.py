@@ -22,7 +22,12 @@ list of them:
      "slot": 2,                    optional (0 / absent = the caller's slot)
      "at": "2026-01-01T12:00:00Z", when it was heard: ISO 8601 with zone, or Unix
                                    seconds; optional (default: now)
-     "source": "ars"}              free text for logs/dashboard; optional
+     "source": "ars",              free text for logs/dashboard; optional
+     "site": "north",              the receiver's site (pattern `site`); optional
+     "latitude": 43.03,            where the receiver is (degrees); optional. Unit
+     "longitude": -77.72}          calls go out only at the radio's site: by `site`
+                                   when both sides have one, else within
+                                   global.site_radius_km of this
 
 Needs paho-mqtt (>=2.0), imported only when the feed is enabled. paho's
 network thread hands each message to the asyncio loop, so the user cache is
@@ -36,9 +41,9 @@ from time import time
 from typing import Any, Dict, Optional
 
 try:
-    from .utils import parse_freq_hz, parse_colorcode
+    from .utils import parse_freq_hz, parse_colorcode, parse_location
 except ImportError:
-    from utils import parse_freq_hz, parse_colorcode
+    from utils import parse_freq_hz, parse_colorcode, parse_location
 
 LOGGER = logging.getLogger(__name__)
 
@@ -87,9 +92,12 @@ class ExternalLastHeard:
         slot = report.get('slot') if report.get('slot') in (1, 2) else 0
         at = _epoch(report.get('at')) or time()
         source = str(report.get('source') or 'external')[:16]
+        lat, lon, height = parse_location(report.get('latitude'), report.get('longitude'), report.get('height'))
+        site = str(report['site'])[:32] if report.get('site') else None
         if self._cache.update(radio_id=radio_id, repeater_id=0, callsign='', slot=slot, talkgroup=0,
                               freq=freq, colorcode=parse_colorcode(report.get('colorcode')),
-                              source=f'{source}-ext', heard_at=at):
+                              source=f'{source}-ext', heard_at=at,
+                              latitude=lat, longitude=lon, height=height, site=site):
             LOGGER.debug(f'External last-heard: {radio_id} on {freq} Hz TS{slot} [{source}]')
 
     def start(self, loop, cfg: Dict[str, Any]):

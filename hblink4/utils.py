@@ -7,6 +7,7 @@ can be used throughout the codebase.
 """
 import logging
 import logging.handlers
+import math
 import pathlib
 from typing import Optional, Tuple, Union
 
@@ -334,3 +335,25 @@ def parse_location(latitude, longitude, height=b'') -> Tuple[Optional[float], Op
         return None, None, None
     h = _ascii_float(height)
     return lat, lon, (int(round(h)) if h is not None else None)
+
+
+def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points (degrees), in km."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def same_site(a_site: Optional[str], a_lat: Optional[float], a_lon: Optional[float],
+              b_site: Optional[str], b_lat: Optional[float], b_lon: Optional[float],
+              radius_km: float) -> bool:
+    """Are two places (a peer, where a radio was heard) at the same site? Both
+    named: the names match. Otherwise both located: within `radius_km`.
+    Otherwise unknown, which counts as the same site, so networks in one place
+    need neither."""
+    if a_site and b_site:
+        return a_site == b_site
+    if None not in (a_lat, a_lon, b_lat, b_lon):
+        return distance_km(a_lat, a_lon, b_lat, b_lon) <= radius_km
+    return True

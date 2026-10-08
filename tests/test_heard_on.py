@@ -133,7 +133,7 @@ def test_group_and_data_streams_are_stamped_too():
     hb._stamp_channel(stream, hb._peer_channel(MODEM1))
     assert (stream.freq, stream.colorcode) == (461_687_500, 1)
     assert hb._peer_channel(0) == {'freq': None, 'colorcode': None, 'latitude': None, 'longitude': None,
-                                   'height': None}
+                                   'height': None, 'site': None}
 
 
 def test_parse_location():

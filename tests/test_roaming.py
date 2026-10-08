@@ -8,7 +8,7 @@ radios on channels no fixed peer transmits on.
 - one hearing a call: never used, used last, or used as needed (roaming_interrupt_rx)
 - DMRK on air → its channel is recorded; refused or unanswered → the next roamer, the
   call replayed; channel busy (or no roamer left) → the call is dropped, reported
-- never a group-call target
+- not a group-call target unless roaming_group_calls says so (test_sites.py)
 """
 import os
 import sys
@@ -302,7 +302,7 @@ def test_no_answer_moves_the_call_on_and_the_last_roamer_failing_drops_it():
     hb = make_hb()
     r1, r2, stream = two_roamers_and_a_call(hb)
     with patch.dict(hblink.CONFIG, CHANNELS):
-        hb._roaming_calls[b'\xaa\xbb\xcc\xdd'].sent_at -= 10
+        hb._roaming_calls[(b'\xaa\xbb\xcc\xdd', rid(ROAM1))].sent_at -= 10
         hb._check_roaming_acks()
         assert stream.target_repeaters == {rid(ROAM2)} and r1.roaming_cooldown_until > 0
         hb._handle_roaming_ack(rid(ROAM2), dmrk(b'\xaa\xbb\xcc\xdd', 4, peer_id=ROAM2))
