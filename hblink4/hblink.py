@@ -92,8 +92,9 @@ try:
         decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
         classify_lc_carrier,
         STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
-        dtype_name, decode_data_header,
+        dtype_name, decode_data_header, decode_bptc_block,
     )
+    from .unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from constants import (
@@ -125,8 +126,9 @@ except ImportError:
         decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
         classify_lc_carrier,
         STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
-        dtype_name, decode_data_header,
+        dtype_name, decode_data_header, decode_bptc_block,
     )
+    from unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS
 
 # Data classes moved to models.py
 
@@ -218,6 +220,10 @@ class HBProtocol(asyncio.DatagramProtocol):
         self._unit_status: "collections.OrderedDict[bytes, str]" = collections.OrderedDict()
         # Why _roaming_route couldn't place a stream, for its outcome report.
         self._route_reason: Dict[bytes, str] = {}
+        # Unit data packets until their outcome is known (unit_data.py): by stream
+        # id (a retry's own id too), and the latest per (src, dst) for responses.
+        self._unit_data: Dict[bytes, UnitDataTx] = {}
+        self._unit_data_pair: Dict[Tuple[bytes, bytes], UnitDataTx] = {}
         
         # No conversion caching - simple int.from_bytes() is fast enough
         # and avoids unbounded cache growth (memory leak prevention)
@@ -1270,6 +1276,11 @@ class HBProtocol(asyncio.DatagramProtocol):
         self._tasks.append(
             asyncio.create_task(self._run_periodic(0.25, self._check_roaming_acks, "roaming ack checker"))
         )
+
+        # Unit data responses due, and retries (global.unit_data_retry)
+        self._tasks.append(
+            asyncio.create_task(self._run_periodic(0.25, self._check_unit_data, "unit data checker"))
+        )
         
         # Start user cache cleanup (fixed at 60s for optimal efficiency)
         self._tasks.append(
@@ -2057,8 +2068,9 @@ class HBProtocol(asyncio.DatagramProtocol):
         routed = (not is_group and source_repeater is not None
                   and source_repeater.unit_calls_enabled
                   and CONFIG.get('global', {}).get('forward_unit_data', False))
+        is_broadcast = False
         if routed:
-            targets, _, target_slots = self._calculate_unit_call_targets(
+            targets, is_broadcast, target_slots = self._calculate_unit_call_targets(
                 owner_id, slot, rf_src, dst_id, stream_id)
             if not targets:
                 self._events.emit('unit_call_unroutable', {
@@ -2110,6 +2122,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         )
         heard_on = self._peer_channel(cache_repeater_id)
         self._stamp_channel(new_stream, heard_on)
+        if not is_group and source_repeater is not None:
+            self._unit_data_start(new_stream, decoded, routed, targets, is_broadcast, src_int, dst_int)
 
         # Populate the user cache — data calls are as good a locator as
         # voice. If a radio beacons APRS from repeater X now, a unit voice
@@ -2609,12 +2623,21 @@ class HBProtocol(asyncio.DatagramProtocol):
                           reason: Optional[str] = None, **extra: Any) -> None:
         """Report what became of a unit call: 'routed' (forwarded to a fixed
         peer or outbound, or broadcast), 'on_air' (a roaming transceiver is
-        sending it) or 'failed' (with `reason`). An event, and on MQTT at
+        sending it) or 'failed' (with `reason`); for a unit data packet also
+        'delivered', 'nacked' or 'no_response' (unit_data.py). An event, and on MQTT at
         `{external_last_heard.status_topic}/{src}` so the caller (e.g. a bot)
-        can send it again. Each status once per stream."""
-        if self._unit_status.get(stream_id) == status:
+        can send it again. Each status once per stream (once per attempt, for
+        a unit data packet HBlink4 sends again: see unit_data.py)."""
+        rec = self._unit_data.get(stream_id)
+        if rec is not None:                                  # unit data: reported under the packet's
+            extra.setdefault('is_data', True)                # first stream id, with the attempt
+            if rec.attempt > 1:
+                extra.setdefault('attempt', rec.attempt)
+            stream_id = rec.stream_id
+        seen = status if 'attempt' not in extra else f'{status}#{extra["attempt"]}'
+        if self._unit_status.get(stream_id) == seen:
             return
-        self._unit_status[stream_id] = status
+        self._unit_status[stream_id] = seen
         self._unit_status.move_to_end(stream_id)
         while len(self._unit_status) > 512:
             self._unit_status.popitem(last=False)
@@ -2629,6 +2652,225 @@ class HBProtocol(asyncio.DatagramProtocol):
                                                   qos=1)
             except Exception as e:
                 LOGGER.warning(f'Unit-call status not published: {e}')
+
+    # ========== UNIT DATA DELIVERY (unit_data.py) ==========
+
+    @staticmethod
+    def _unit_data_retry_cfg() -> Optional[Dict[str, float]]:
+        """`global.unit_data_retry` when enabled: {'attempts', 'wait_s'}; else None."""
+        cfg = CONFIG.get('global', {}).get('unit_data_retry') or {}
+        if not cfg.get('enabled'):
+            return None
+        return {'attempts': max(0, int(cfg.get('attempts', 2))), 'wait_s': max(0.0, float(cfg.get('wait_s', 2.0)))}
+
+    def _unit_data_start(self, stream: StreamState, decoded: Optional[Dict[str, Any]], forwarded: bool,
+                         targets: set, is_broadcast: bool, src_int: int, dst_int: int) -> None:
+        """A unit data stream from a local peer: report it as a unit call is
+        reported (routed / on_air / failed) and keep a record of it until its
+        outcome is known. Response packets aren't reported themselves: they
+        are the outcome of the packet they answer (_unit_data_header)."""
+        if decoded is not None and decoded['dpf'] == 1:
+            return
+        stream_id = stream.stream_id
+        if not forwarded:
+            reason = ('unit calls not enabled' if CONFIG.get('global', {}).get('forward_unit_data', False)
+                      else 'unit data not forwarded')
+            self._unit_call_status(stream_id, src_int, dst_int, 'failed', reason, is_data=True)
+            return
+        now = time()
+        rec = UnitDataTx(stream_id=stream_id, rf_src=stream.rf_src, dst_id=stream.dst_id,
+                         source_rid=stream.repeater_id, slot=stream.slot, started=now, last_seen=now,
+                         packets=[] if self._unit_data_retry_cfg() else None)
+        stream.unit_data = rec
+        self._unit_data_track(rec)
+        reason = self._route_reason.pop(stream_id, None)
+        if not targets:
+            rec.failed_reason = reason or 'no route'
+            if not self._unit_data_retry_cfg():
+                self._unit_data_finish(rec, 'failed', rec.failed_reason)
+        elif is_broadcast:
+            self._unit_call_status(stream_id, src_int, dst_int, 'routed', 'broadcast')
+        elif not any(k[0] == stream_id for k in self._roaming_calls):    # a roamer answers DMRK first
+            self._unit_call_status(stream_id, src_int, dst_int, 'routed')
+
+    def _unit_data_track(self, rec: UnitDataTx) -> None:
+        """Index `rec` by its current stream id and as the latest packet from its
+        source to its destination (what a response from there answers)."""
+        key = (rec.rf_src, rec.dst_id)
+        old = self._unit_data_pair.get(key)
+        if old is not None and old is not rec and not old.done and old.deadline is not None:
+            self._unit_data_finish(old, 'no_response', 'superseded by a newer packet')
+        self._unit_data_pair[key] = rec
+        self._unit_data[rec.current_sid] = rec
+
+    def _unit_data_forget(self, rec: UnitDataTx) -> None:
+        for sid in [k for k, v in self._unit_data.items() if v is rec]:
+            del self._unit_data[sid]
+        key = (rec.rf_src, rec.dst_id)
+        if self._unit_data_pair.get(key) is rec:
+            del self._unit_data_pair[key]
+
+    def _unit_data_header(self, stream: StreamState, header: Dict[str, Any]) -> None:
+        """A data stream's header is in: note what a unit data packet asks for,
+        or match a response to the packet it answers."""
+        raw = header['raw']
+        if header['dpf'] == 1:
+            if stream.unit_data is not None:                 # preambles came first: it was taken for a packet
+                self._unit_data_forget(stream.unit_data)
+                stream.unit_data = None
+            rec = self._unit_data_pair.get((stream.dst_id, stream.rf_src))
+            response = parse_response(raw)
+            if rec is None or rec.done or not rec.confirmed or response is None:
+                return
+            if response.cls == 2 and response.blocks > 0:    # selective ACK: its flags follow
+                stream.sack_for, stream.sack_blocks = rec, []
+                return
+            self._unit_data_response(rec, response)
+        elif stream.unit_data is not None:
+            rec = stream.unit_data
+            rec.confirmed = header['dpf'] == 3 and header['response_requested']
+            rec.ns = (raw[9] >> 4) & 7 if header['dpf'] == 3 else None
+            rec.blocks = header['blocks_to_follow']
+
+    def _unit_data_response(self, rec: UnitDataTx, response, missing: Optional[List[int]] = None) -> None:
+        extra: Dict[str, Any] = {'response': response.kind, 'ns': response.status}
+        if missing is not None:
+            extra['missing'] = missing
+        LOGGER.info(f'Unit data {rec.stream_id.hex()} {bytes_to_int(rec.rf_src)} → {bytes_to_int(rec.dst_id)}: '
+                    f'{response.kind.upper()}' + (f' ({response.reason})' if response.reason else '')
+                    + (f', blocks {missing} missing' if missing else ''))
+        if response.outcome == 'delivered':
+            self._unit_data_finish(rec, 'delivered', None, **extra)
+        else:
+            self._unit_data_outcome(rec, 'nacked', response.reason, response.worth_retrying, **extra)
+
+    def _unit_data_complete(self, stream: StreamState) -> None:
+        """A data stream's blocks are all in (and forwarded)."""
+        if stream.sack_for is not None:
+            rec, stream.sack_for = stream.sack_for, None
+            joined = b''.join(stream.sack_blocks or [])
+            flags = joined[:16] if len(joined) >= 24 else joined[:8]
+            response = parse_response(stream.data_header['raw']) if stream.data_header else None
+            if response is not None and not rec.done:
+                self._unit_data_response(rec, response, sack_missing(flags, rec.blocks))
+        rec = stream.unit_data
+        if rec is not None and not rec.done and rec.attempt == 1:
+            self._unit_data_sent(rec)
+
+    def _unit_data_sent(self, rec: UnitDataTx) -> None:
+        """An attempt at `rec` is all out: wait for its response, if it asked
+        for one; otherwise routed (already reported) or failed is its outcome."""
+        now = time()
+        rec.completed_at = now
+        if rec.failed_reason is not None:
+            self._unit_data_outcome(rec, 'failed', rec.failed_reason, rec.failed_reason not in NO_RETRY_REASONS)
+        elif rec.confirmed:
+            rec.deadline = now + float(CONFIG.get('global', {}).get('unit_data_response_timeout', 5.0))
+        else:
+            rec.done, rec.packets = True, None
+
+    def _unit_data_outcome(self, rec: UnitDataTx, status: str, reason: Optional[str], retry: bool,
+                           **extra: Any) -> None:
+        """A negative outcome: sent again later (global.unit_data_retry), or final."""
+        cfg = self._unit_data_retry_cfg()
+        if retry and cfg is not None and rec.packets and rec.attempt <= cfg['attempts']:
+            rec.deadline, rec.retry_at = None, time() + cfg['wait_s']
+            LOGGER.info(f'Unit data {rec.stream_id.hex()} to {bytes_to_int(rec.dst_id)}: {status}'
+                        + (f' ({reason})' if reason else '') + f', sending it again in {cfg["wait_s"]:g} s')
+            return
+        self._unit_data_finish(rec, status, reason, **extra)
+
+    def _unit_data_finish(self, rec: UnitDataTx, status: str, reason: Optional[str], **extra: Any) -> None:
+        rec.done, rec.deadline, rec.retry_at, rec.packets = True, None, None, None
+        self._unit_call_status(rec.stream_id, bytes_to_int(rec.rf_src), bytes_to_int(rec.dst_id), status, reason,
+                               **extra)
+
+    def _check_unit_data(self) -> None:
+        """Responses overdue (no_response), retries due, and old records."""
+        now = time()
+        stale = CONFIG.get('global', {}).get('stream_timeout', 2.0)
+        timeout = float(CONFIG.get('global', {}).get('unit_data_response_timeout', 5.0))
+        for rec in list({id(r): r for r in self._unit_data.values()}.values()):
+            if rec.done:
+                if now - rec.last_seen > 60:
+                    self._unit_data_forget(rec)
+                continue
+            if rec.completed_at is None and rec.retry_at is None and now - rec.last_seen > stale:
+                self._unit_data_sent(rec)                    # its blocks never all came
+            if rec.deadline is not None and now >= rec.deadline:
+                self._unit_data_outcome(rec, 'no_response', f'no response in {timeout:g} s', True)
+            elif rec.retry_at is not None and now >= rec.retry_at:
+                self._unit_data_resend(rec)
+
+    def _later(self, delay: float, fn) -> None:
+        """Run `fn` after `delay` seconds on the event loop (at once without one, e.g. in tests)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            fn()
+            return
+        loop.call_later(delay, fn)
+
+    def _unit_data_resend(self, rec: UnitDataTx) -> None:
+        """global.unit_data_retry: route `rec` afresh, as a new stream, and send
+        its packets again one burst per 60 ms."""
+        rec.attempt += 1
+        rec.retry_at = rec.completed_at = rec.deadline = rec.failed_reason = None
+        sid = randint(1, 0xFFFFFFFE).to_bytes(4, 'big')
+        rec.current_sid, rec.last_seen = sid, time()
+        self._unit_data_track(rec)
+        src_int, dst_int = bytes_to_int(rec.rf_src), bytes_to_int(rec.dst_id)
+        targets, is_broadcast, target_slots = self._calculate_unit_call_targets(
+            rec.source_rid, rec.slot, rec.rf_src, rec.dst_id, sid)
+        reason = self._route_reason.pop(sid, None)
+        if not targets:
+            rec.failed_reason = reason or 'no route'
+            LOGGER.info(f'Unit data {rec.stream_id.hex()} to {dst_int}: try {rec.attempt} not sent ({rec.failed_reason})')
+            self._unit_data_sent(rec)
+            return
+        if is_broadcast:
+            self._unit_call_status(sid, src_int, dst_int, 'routed', 'broadcast')
+        elif not any(k[0] == sid for k in self._roaming_calls):
+            self._unit_call_status(sid, src_int, dst_int, 'routed')
+        packets = list(rec.packets or [])
+        LOGGER.info(f'Unit data {rec.stream_id.hex()} {src_int} → {dst_int}: sending it again (try {rec.attempt}, '
+                    f'{len(packets)} packets) as stream {sid.hex()}')
+        for i, packet in enumerate(packets):
+            self._later(i * 0.06, lambda p=packet, last=(i == len(packets) - 1):
+                        self._unit_data_send_one(rec, sid, p, last, targets, target_slots))
+
+    def _unit_data_send_one(self, rec: UnitDataTx, sid: bytes, packet: bytes, last: bool, targets: set,
+                            target_slots: Dict[Any, int]) -> None:
+        if rec.current_sid != sid or rec.done:
+            return                                           # superseded
+        buf = bytearray(packet)
+        buf[16:20] = sid
+        source_rid = bytes_to_int(rec.source_rid)
+        for target in targets:
+            if isinstance(target, tuple) and target[0] == 'outbound':
+                outbound = self._outbounds.get(target[1])
+                if not outbound or not outbound.authenticated:
+                    continue
+                out = bytearray(buf)
+                out[11:15] = outbound.config.radio_id.to_bytes(4, 'big')
+                outbound.send(bytes(out))
+                self._update_assumed_stream_outbound(outbound, rec.slot, rec.rf_src, rec.dst_id, sid, last,
+                                                     source_rid, is_unit_call=True)
+                continue
+            repeater = self._repeaters.get(target)
+            if repeater is None:
+                continue
+            out_slot = (target_slots or {}).get(target, rec.slot)
+            out = bytearray(buf)
+            out[15] = (out[15] | 0x80) if out_slot == 2 else (out[15] & 0x7F)
+            repeater.send(bytes(out))
+            if repeater.roaming:
+                self._roaming_sent(sid, target, bytes(out), last, rec.rf_src, rec.dst_id, source_rid)
+            self._update_assumed_stream(repeater, out_slot, rec.rf_src, rec.dst_id, sid, last, source_rid,
+                                        is_unit_call=True)
+        rec.last_seen = time()
+        if last:
+            self._unit_data_sent(rec)
 
     def _peer_channel(self, repeater_id: int) -> Dict[str, Any]:
         """Where a local peer is hearing right now, as user-cache kwargs: the
@@ -2986,6 +3228,9 @@ class HBProtocol(asyncio.DatagramProtocol):
             return                                           # an old call, already handed on
         source = self._roaming_source_stream(stream_id)
         if source is None:
+            rec = self._unit_data.get(stream_id)
+            if rec is not None and rec.current_sid == stream_id and not rec.done:
+                rec.failed_reason = reason                   # HBlink4's own retry of unit data
             return                                           # the call itself is gone
         nxt = self._roaming_dispatch(call) if try_another else None
         owner, slot, src_stream = source
@@ -3013,6 +3258,12 @@ class HBProtocol(asyncio.DatagramProtocol):
             'repeater_id': rid_to_int(src_stream.repeater_id) if src_stream.repeater_id else None,
             'slot': slot, 'src_id': bytes_to_int(src_stream.rf_src),
             'dst_id': bytes_to_int(src_stream.dst_id), 'reason': reason})
+        rec = self._unit_data.get(stream_id)
+        if rec is not None and not rec.done:                 # unit data: its record reports (and retries)
+            rec.failed_reason = reason
+            if rec.completed_at is not None:
+                self._unit_data_sent(rec)
+            return
         self._unit_call_status(stream_id, bytes_to_int(src_stream.rf_src), bytes_to_int(src_stream.dst_id),
                                'failed', reason)
 
@@ -4557,12 +4808,28 @@ class HBProtocol(asyncio.DatagramProtocol):
         # `forward_unit_data`), and ended once the header's blocks are all in,
         # since data has no terminator. No stream_update telemetry.
         if current_stream and current_stream.call_type == 'data':
+            rec = current_stream.unit_data
+            if rec is not None:
+                rec.last_seen = time()
+                if rec.packets is not None:                 # kept for global.unit_data_retry
+                    if len(rec.packets) < MAX_KEPT_PACKETS:
+                        rec.packets.append(data)
+                    else:
+                        rec.packets = None
+            had_header = current_stream.data_header is not None
             done = self._count_data_frame(current_stream, _frame_type, _dtype_vseq, _payload)
+            if not had_header and current_stream.data_header is not None:
+                self._unit_data_header(current_stream, current_stream.data_header)
+            elif current_stream.sack_blocks is not None and _frame_type == 2 and _dtype_vseq == 7:
+                block = decode_bptc_block(_payload)
+                if block is not None:
+                    current_stream.sack_blocks.append(block)
             if current_stream.target_repeaters:
                 self._forward_stream(data, repeater_id, _slot, _rf_src, _dst_id, _stream_id,
                                      end_of_stream=done)
             if done:
                 self._end_stream(current_stream, repeater_id, _slot, time(), 'data_complete')
+                self._unit_data_complete(current_stream)
             return
         
         # Per-packet logging - only enable for heavy troubleshooting
@@ -4612,6 +4879,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             header = decode_data_header(payload)
             if header is None or header['dpf'] not in (1, 2, 3):
                 return False
+            stream.data_header = header
             stream.data_blocks_left = header['blocks_to_follow']
             return stream.data_blocks_left == 0
         if stream.data_blocks_left > 0 and dtype_vseq in (6, 7, 8, 10):
@@ -4664,6 +4932,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                 is_unit_call=is_unit_call,
             )
             repeater.set_slot_stream(slot, new_stream)
+            # A one-packet stream (a data response header) starts and ends here:
+            # the terminator below must end this stream, not the slot's last one.
+            current_stream = new_stream
 
             # Log at DEBUG level - TX streams are noisy
             if is_unit_call:
@@ -4745,6 +5016,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 is_unit_call=is_unit_call,
             )
             outbound.set_slot_stream(slot, new_stream)
+            current_stream = new_stream             # a one-packet stream ends below (see _update_assumed_stream)
 
             # Emit stream_start event for dashboard (using outbound connection name as identifier)
             # Keep structure minimal and JSON-serializable (match repeater-style fields

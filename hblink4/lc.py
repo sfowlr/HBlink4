@@ -302,6 +302,12 @@ def _decode_bptc_96(payload: bytes) -> Optional[bytes]:
     return full.tobytes()
 
 
+def decode_bptc_block(payload: bytes) -> Optional[bytes]:
+    """The 12 octets of any BPTC(196,96) data burst (a Rate 1/2 data block,
+    e.g. a selective ACK's flags), or None on decode failure."""
+    return _decode_bptc_96(payload)
+
+
 def decode_data_header(payload: bytes) -> Optional[Dict[str, object]]:
     """Extract identifying fields from a DMR Data Header payload.
 

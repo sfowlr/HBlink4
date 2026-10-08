@@ -112,6 +112,7 @@ Key configuration patterns:
 | `hblink4/constants.py` | Protocol command constants and DMR sync patterns |
 | `hblink4/utils.py` | Pure utility functions (ID formatting, logging, connection type detection) |
 | `hblink4/lc.py` | Link Control encoding/decoding for DMR data calls and talker aliases |
+| `hblink4/unit_data.py` | Unit data delivery: response packet decoding (ACK/NACK/selective ACK), the per-packet record behind `delivered` / `nacked` / `no_response`, and `global.unit_data_retry` |
 | `dashboard/server.py` | FastAPI app with WebSocket event receiver and REST endpoints |
 | `dashboard/user_db.py` | RadioID.net user database caching with background refresh |
 
@@ -229,6 +230,7 @@ Test files in `tests/`:
 - **test_lc.py**: Link Control encoding/decoding
 - **test_hang_time.py**: Slot hang time and conversation continuity
 - **test_connection_type.py**: Device type categorization logic
+- **test_unit_data_delivery.py**: Unit data outcomes (routed/failed, then delivered/nacked/no_response from the radio's response packet) and the optional retry
 - **test_sctp.py**: SCTP protocol delegation, send callable patterns, availability detection (mock-based tests run everywhere; real socket tests Linux-only)
 
 Load test configurations from `config/config_sample.json` to validate patterns work as documented.

@@ -118,6 +118,13 @@ class StreamState:
     # header is seen, or for data formats that aren't counted). The stream
     # ends when it reaches 0, since data never sends a terminator.
     data_blocks_left: Optional[int] = None
+    # Data streams: the decoded data header (lc.decode_data_header), once seen.
+    data_header: Optional[Dict[str, Any]] = None
+    # Unit data: the packet's delivery record (unit_data.UnitDataTx), when routed.
+    unit_data: Any = None
+    # A selective ACK response: the packet it answers, and its flag blocks as they come.
+    sack_for: Any = None
+    sack_blocks: Optional[list] = None
 
     # DMR Link Control for outbound rewrites under translation.
     #
