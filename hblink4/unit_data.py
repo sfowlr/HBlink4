@@ -22,12 +22,17 @@ Rate 1/2 blocks of flags (figure 8.17): bit j of octet k is block 8k + j,
 (firmware dmrData.c, dmrDataBuildResponseAck) and DSD-FME's decoder
 (src/dmr_block.c) read the header the same way.
 
-`global.unit_data_retry` ({"enabled": false, "attempts": 2, "wait_s": 2.0}):
-for senders with no retry logic of their own, HBlink4 keeps each unit data
-packet it routes and, `wait_s` after a no_response, a NACK worth resending
-(packet CRC, memory full), a selective ACK or a retryable failure (no route,
-channel busy, hang time …), sends the whole packet again — routed afresh, as
-a new stream — up to `attempts` more times, then reports the final outcome.
+`global.unit_data_retry` ({"enabled": false, "attempts": 2, "wait_s": 10.0,
+"busy_wait_s": 120.0}): for senders with no retry logic of their own, HBlink4
+keeps each unit data packet it routes and, `wait_s` after a no_response, a NACK
+worth resending (packet CRC, memory full), a selective ACK or a retryable
+failure (no route …), sends the whole packet again — routed afresh, as a new
+stream — up to `attempts` more times, then reports the final outcome.
+
+A busy destination (BUSY_REASONS: its slot in a call or hang time, its channel
+busy, no roaming transceiver free) isn't a failed attempt: the packet waits,
+routed again every BUSY_POLL_S, and goes as soon as there's room — for up to
+`busy_wait_s`, then it fails.
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -48,6 +53,9 @@ NACK_REASONS = {
 NACK_RETRY = (1, 2)
 # Failures retrying won't fix: the source isn't allowed to send unit data.
 NO_RETRY_REASONS = ('unit calls not enabled', 'unit data not forwarded')
+# The destination is busy, not unreachable: wait for it, without using up an attempt.
+BUSY_REASONS = ('slot busy', 'slot in hang time', 'channel busy', 'transceiver busy', 'no roaming transceiver free')
+BUSY_POLL_S = 0.5
 
 MAX_KEPT_PACKETS = 200          # preambles + header + 127 blocks, with room
 
@@ -114,6 +122,8 @@ class UnitDataTx:
     completed_at: Optional[float] = None
     deadline: Optional[float] = None    # a response is due by then
     retry_at: Optional[float] = None
+    busy_since: Optional[float] = None  # waiting for a busy destination since (BUSY_REASONS)
+    busy_retry: bool = False            # the next send is after a busy wait: not a new attempt
     failed_reason: Optional[str] = None
     done: bool = False
     extra: Dict[str, object] = field(default_factory=dict)

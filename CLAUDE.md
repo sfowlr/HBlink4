@@ -112,7 +112,7 @@ Key configuration patterns:
 | `hblink4/constants.py` | Protocol command constants and DMR sync patterns |
 | `hblink4/utils.py` | Pure utility functions (ID formatting, logging, connection type detection) |
 | `hblink4/lc.py` | Link Control encoding/decoding for DMR data calls and talker aliases |
-| `hblink4/unit_data.py` | Unit data delivery: response packet decoding (ACK/NACK/selective ACK), the per-packet record behind `delivered` / `nacked` / `no_response`, and `global.unit_data_retry` |
+| `hblink4/unit_data.py` | Unit data delivery: response packet decoding (ACK/NACK/selective ACK), the per-packet record behind `delivered` / `nacked` / `no_response`, and `global.unit_data_retry` (a busy destination waits for room, not an attempt) |
 | `dashboard/server.py` | FastAPI app with WebSocket event receiver and REST endpoints |
 | `dashboard/user_db.py` | RadioID.net user database caching with background refresh |
 

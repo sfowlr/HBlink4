@@ -10,6 +10,8 @@ Unit data delivery (unit_data.py): what became of each unit data packet.
 - global.unit_data_retry: HBlink4 sends the packet again (a new stream,
   routed afresh) on no_response / NACK worth it / selective ACK / a
   retryable failure, then reports the final outcome
+- a busy destination isn't a failed attempt: the packet waits for room (up to
+  busy_wait_s) and goes as soon as the slot is free
 """
 import os
 import sys
@@ -18,6 +20,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hblink4 import hblink
+from hblink4.models import StreamState
 from hblink4.unit_data import parse_response, sack_missing
 
 from test_unit_call_routing import MODEM1, RADIO, heard, rid
@@ -236,6 +239,95 @@ def test_retry_is_off_by_default_and_keeps_nothing():
         clock.t += 6
         hb._check_unit_data()
     assert len(hb._repeaters[rid(MODEM1)].sent) == 6
+
+
+# ── a busy destination ───────────────────────────────────────────────────────
+
+ONCE = {**BASE, 'unit_data_retry': {'enabled': True, 'attempts': 1, 'wait_s': 10.0, 'busy_wait_s': 120.0}}
+
+
+def busy(hb, clock, src=3333, stream=b'\xbb\xbb\xbb\xbb'):
+    """Another radio's group call on MODEM1 TS2, the slot our radio was heard on."""
+    s = StreamState(repeater_id=rid(MODEM1), rf_src=src.to_bytes(3, 'big'), dst_id=(9).to_bytes(3, 'big'),
+                    slot=2, start_time=clock.t, last_seen=clock.t, stream_id=stream, call_type='group')
+    hb._repeaters[rid(MODEM1)].set_slot_stream(2, s)
+    return s
+
+
+def poll(hb, clock, seconds, step=0.5):
+    for _ in range(int(seconds / step)):
+        clock.t += step
+        hb._check_unit_data()
+
+
+def test_a_busy_slot_waits_for_room_without_using_an_attempt():
+    hb, clock = rig(), Clock()
+    modem = hb._repeaters[rid(MODEM1)]
+    with patch.dict(hblink.CONFIG, {'global': ONCE}), patch.object(hblink, 'time', clock):
+        call = busy(hb, clock)
+        feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
+        poll(hb, clock, 30)                                      # a long call: nothing sent, nothing final
+        assert modem.sent == [] and outcomes(hb) == []
+        call.ended, call.end_time = True, clock.t                # it ends; then its hang time (3 s)
+        poll(hb, clock, 2.5)
+        assert modem.sent == []
+        poll(hb, clock, 1.0)
+        assert len(modem.sent) == 6 and outcomes(hb) == [('routed', None, None)]   # still the first attempt
+        clock.t += 5.1
+        hb._check_unit_data()                                    # no response: the one retry, 10 s on
+        poll(hb, clock, 10)
+        assert len(modem.sent) == 12 and outcomes(hb)[-1] == ('routed', None, 2)
+        respond(hb, 0, 1)
+    assert outcomes(hb)[-1] == ('delivered', None, 2)
+
+
+def test_a_retry_that_finds_the_slot_busy_waits_too():
+    hb, clock = rig(), Clock()
+    modem = hb._repeaters[rid(MODEM1)]
+    with patch.dict(hblink.CONFIG, {'global': ONCE}), patch.object(hblink, 'time', clock):
+        feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
+        clock.t += 5.1
+        hb._check_unit_data()                                    # no response
+        call = busy(hb, clock)                                   # and now the radio's slot is taken
+        poll(hb, clock, 40)
+        assert len(modem.sent) == 6 and outcomes(hb) == [('routed', None, None)]
+        call.ended, call.end_time = True, clock.t
+        poll(hb, clock, 3.5)
+        assert len(modem.sent) == 12 and outcomes(hb)[-1] == ('routed', None, 2)
+
+
+def test_a_slot_busy_past_busy_wait_s_fails():
+    hb, clock = rig(), Clock()
+    with patch.dict(hblink.CONFIG, {'global': ONCE}), patch.object(hblink, 'time', clock):
+        busy(hb, clock)
+        feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
+        poll(hb, clock, 119)
+        assert outcomes(hb) == []
+        poll(hb, clock, 2)
+    assert outcomes(hb) == [('failed', 'slot busy for 120 s', None)]
+    assert hb._repeaters[rid(MODEM1)].sent == []
+
+
+def test_a_newer_packet_replaces_one_waiting_for_room():
+    hb, clock = rig(), Clock()
+    modem = hb._repeaters[rid(MODEM1)]
+    with patch.dict(hblink.CONFIG, {'global': ONCE}), patch.object(hblink, 'time', clock):
+        call = busy(hb, clock)
+        feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
+        poll(hb, clock, 4)
+        feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3, ns=4), stream=0x5EED0002))  # the sender's own retry
+        assert outcomes(hb) == [('no_response', 'superseded by a newer packet', None)]
+        call.ended, call.end_time = True, clock.t
+        poll(hb, clock, 3.5)
+    assert len(modem.sent) == 6                                  # only the newer one goes out
+
+
+def test_slot_busy_is_the_route_reason():
+    hb, clock = rig(), Clock()
+    with patch.dict(hblink.CONFIG, {'global': BASE}), patch.object(hblink, 'time', clock):
+        busy(hb, clock)
+        feed(hb, GATEWAY_PEER, packet(confirmed12(GATEWAY_ID, RADIO, 3)))
+    assert outcomes(hb) == [('failed', 'slot busy', None)]
 
 
 # ── regressions seen on the sandbox, 2026-10-08 ──────────────────────────────

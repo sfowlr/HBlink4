@@ -94,7 +94,8 @@ try:
         STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
         dtype_name, decode_data_header, decode_bptc_block,
     )
-    from .unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS
+    from .unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS, \
+        BUSY_REASONS, BUSY_POLL_S
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from constants import (
@@ -128,7 +129,8 @@ except ImportError:
         STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
         dtype_name, decode_data_header, decode_bptc_block,
     )
-    from unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS
+    from unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS, \
+        BUSY_REASONS, BUSY_POLL_S
 
 # Data classes moved to models.py
 
@@ -2657,11 +2659,12 @@ class HBProtocol(asyncio.DatagramProtocol):
 
     @staticmethod
     def _unit_data_retry_cfg() -> Optional[Dict[str, float]]:
-        """`global.unit_data_retry` when enabled: {'attempts', 'wait_s'}; else None."""
+        """`global.unit_data_retry` when enabled: {'attempts', 'wait_s', 'busy_wait_s'}; else None."""
         cfg = CONFIG.get('global', {}).get('unit_data_retry') or {}
         if not cfg.get('enabled'):
             return None
-        return {'attempts': max(0, int(cfg.get('attempts', 2))), 'wait_s': max(0.0, float(cfg.get('wait_s', 2.0)))}
+        return {'attempts': max(0, int(cfg.get('attempts', 2))), 'wait_s': max(0.0, float(cfg.get('wait_s', 10.0))),
+                'busy_wait_s': max(0.0, float(cfg.get('busy_wait_s', 120.0)))}
 
     def _unit_data_start(self, stream: StreamState, decoded: Optional[Dict[str, Any]], forwarded: bool,
                          targets: set, is_broadcast: bool, src_int: int, dst_int: int) -> None:
@@ -2698,7 +2701,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         source to its destination (what a response from there answers)."""
         key = (rec.rf_src, rec.dst_id)
         old = self._unit_data_pair.get(key)
-        if old is not None and old is not rec and not old.done and old.deadline is not None:
+        if old is not None and old is not rec and not old.done and (old.deadline is not None
+                                                                    or old.retry_at is not None):
             self._unit_data_finish(old, 'no_response', 'superseded by a newer packet')
         self._unit_data_pair[key] = rec
         self._unit_data[rec.current_sid] = rec
@@ -2773,6 +2777,18 @@ class HBProtocol(asyncio.DatagramProtocol):
                            **extra: Any) -> None:
         """A negative outcome: sent again later (global.unit_data_retry), or final."""
         cfg = self._unit_data_retry_cfg()
+        if retry and cfg is not None and rec.packets and reason in BUSY_REASONS:
+            now = time()                                     # busy: wait for room, not a new attempt
+            if rec.busy_since is None:
+                rec.busy_since = now
+                LOGGER.info(f'Unit data {rec.stream_id.hex()} to {bytes_to_int(rec.dst_id)}: {reason}, '
+                            f'waiting up to {cfg["busy_wait_s"]:g} s to send it')
+            if now - rec.busy_since < cfg['busy_wait_s']:
+                rec.deadline, rec.retry_at, rec.busy_retry = None, now + BUSY_POLL_S, True
+                return
+            reason = f'{reason} for {cfg["busy_wait_s"]:g} s'
+            self._unit_data_finish(rec, status, reason, **extra)
+            return
         if retry and cfg is not None and rec.packets and rec.attempt <= cfg['attempts']:
             rec.deadline, rec.retry_at = None, time() + cfg['wait_s']
             LOGGER.info(f'Unit data {rec.stream_id.hex()} to {bytes_to_int(rec.dst_id)}: {status}'
@@ -2814,7 +2830,9 @@ class HBProtocol(asyncio.DatagramProtocol):
     def _unit_data_resend(self, rec: UnitDataTx) -> None:
         """global.unit_data_retry: route `rec` afresh, as a new stream, and send
         its packets again one burst per 60 ms."""
-        rec.attempt += 1
+        if not rec.busy_retry:
+            rec.attempt += 1
+        rec.busy_retry = False
         rec.retry_at = rec.completed_at = rec.deadline = rec.failed_reason = None
         sid = randint(1, 0xFFFFFFFE).to_bytes(4, 'big')
         rec.current_sid, rec.last_seen = sid, time()
@@ -2825,9 +2843,14 @@ class HBProtocol(asyncio.DatagramProtocol):
         reason = self._route_reason.pop(sid, None)
         if not targets:
             rec.failed_reason = reason or 'no route'
-            LOGGER.info(f'Unit data {rec.stream_id.hex()} to {dst_int}: try {rec.attempt} not sent ({rec.failed_reason})')
+            if rec.failed_reason not in BUSY_REASONS:
+                LOGGER.info(f'Unit data {rec.stream_id.hex()} to {dst_int}: try {rec.attempt} not sent '
+                            f'({rec.failed_reason})')
             self._unit_data_sent(rec)
             return
+        if rec.busy_since is not None:
+            LOGGER.info(f'Unit data {rec.stream_id.hex()} to {dst_int}: room after {time() - rec.busy_since:.1f} s')
+            rec.busy_since = None
         if is_broadcast:
             self._unit_call_status(sid, src_int, dst_int, 'routed', 'broadcast')
         elif not any(k[0] == sid for k in self._roaming_calls):
@@ -2941,6 +2964,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                     and not self._is_outbound_slot_busy(outbound, slot, stream_id,
                                                         rf_src, dst_id, is_unit_call=True)):
                 return (('outbound', entry.outbound_name), slot)
+            if outbound is not None and outbound.authenticated and outbound.config.unit_calls_enabled:
+                self._route_reason[stream_id] = 'slot busy'
             return None
 
         out_slot = entry.slot if entry.slot in (1, 2) else slot
@@ -2951,12 +2976,17 @@ class HBProtocol(asyncio.DatagramProtocol):
             candidates = [r for r in self._fixed_tx_peers(entry.freq, entry.colorcode) if self._at_site(r, entry)]
         else:
             candidates = []
+        busy = False
         for repeater in candidates:
             if repeater.repeater_id == source_repeater_id:
                 continue
             if self._unit_target_ok(repeater, out_slot, stream_id, rf_src, dst_id):
                 return (repeater.repeater_id, out_slot)
+            busy = busy or (repeater.connection_state == 'connected' and repeater.unit_calls_enabled
+                            and repeater.tx_capable)         # it could send, but its slot is taken
         if candidates or entry.freq is None:
+            if busy:
+                self._route_reason[stream_id] = 'slot busy'
             return None
         return self._roaming_route(entry.freq, entry.colorcode, rf_src, dst_id, stream_id, entry)
 
@@ -3231,6 +3261,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             rec = self._unit_data.get(stream_id)
             if rec is not None and rec.current_sid == stream_id and not rec.done:
                 rec.failed_reason = reason                   # HBlink4's own retry of unit data
+                if rec.completed_at is not None:
+                    self._unit_data_sent(rec)
             return                                           # the call itself is gone
         nxt = self._roaming_dispatch(call) if try_another else None
         owner, slot, src_stream = source
