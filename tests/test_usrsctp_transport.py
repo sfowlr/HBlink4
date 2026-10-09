@@ -276,6 +276,44 @@ class TestDmrdLifetime(unittest.TestCase):
         self.assertEqual(self._infotype(lib.usrsctp_sendv.call_args), SCTP_SENDV_NOINFO)
 
 
+class TestAssociationEnd(unittest.TestCase):
+    """A shutdown, or an association that's gone (aborted, peer given up on),
+    closes the socket and reports the loss; "nothing to read" doesn't."""
+
+    def _drain(self, n, err):
+        import errno as _errno
+        lib = _mock_lib()
+        lib.usrsctp_recvv.return_value = n
+        loop = Mock()
+        on_close = Mock()
+        with patch('hblink4.usrsctp_transport._lib', lib):
+            sock = UsrsctpSocket(0x1234, ('10.0.0.1', 62031), loop, Mock(), on_close)
+            with patch('hblink4.usrsctp_transport.ctypes.get_errno', return_value=err):
+                sock._drain_recv()
+            # run what was posted to the loop
+            for call in loop.call_soon_threadsafe.call_args_list:
+                call.args[0](*call.args[1:])
+        return lib, on_close
+
+    def test_shutdown_closes(self):
+        lib, on_close = self._drain(0, 0)
+        on_close.assert_called_once()
+        lib.usrsctp_close.assert_called_once_with(0x1234)
+
+    def test_error_closes(self):
+        import errno as _errno
+        for err in (_errno.ECONNRESET, _errno.ENOTCONN, _errno.ETIMEDOUT):
+            lib, on_close = self._drain(-1, err)
+            on_close.assert_called_once()
+            lib.usrsctp_close.assert_called_once_with(0x1234)
+
+    def test_would_block_keeps_open(self):
+        import errno as _errno
+        lib, on_close = self._drain(-1, _errno.EAGAIN)
+        on_close.assert_not_called()
+        lib.usrsctp_close.assert_not_called()
+
+
 class TestOutboundConnectOptions(unittest.TestCase):
     """usrsctp_connect sets RTO and the server's UDP port before connecting."""
 

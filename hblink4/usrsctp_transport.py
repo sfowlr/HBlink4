@@ -102,6 +102,8 @@ SCTP_EVENT_READ = 0x0001
 SCTP_EVENT_WRITE = 0x0002
 SCTP_EVENT_ERROR = 0x0004
 MSG_NOTIFICATION = 0x2000
+# recvv errors that only mean "nothing more to read now"
+_RETRY_ERRNOS = (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR)
 MSG_EOR = 0x8
 
 # sockaddr_conn layout differs between BSD (macOS) and Linux
@@ -460,7 +462,7 @@ class UsrsctpSocket:
         if self._closed:
             return
         events = _lib.usrsctp_get_events(sock_ptr)
-        if events & 0x0001:  # SCTP_EVENT_READ
+        if events & (SCTP_EVENT_READ | SCTP_EVENT_ERROR):
             self._drain_recv()
 
     def _drain_recv(self):
@@ -485,8 +487,10 @@ class UsrsctpSocket:
                 byref(info), byref(infolen), byref(infotype), byref(msg_flags)
             )
             if n <= 0:
-                if n == 0:
-                    # Connection closed
+                # 0: the peer shut down. An error other than "nothing more
+                # to read": the association is gone (aborted, or the peer
+                # was given up on after retransmissions or heartbeats).
+                if n == 0 or ctypes.get_errno() not in _RETRY_ERRNOS:
                     self._loop.call_soon_threadsafe(self._handle_close)
                 break
 
@@ -494,13 +498,14 @@ class UsrsctpSocket:
             if msg_flags.value & MSG_NOTIFICATION:
                 continue
 
-            data = buf.raw[:n]
+            data = ctypes.string_at(buf, n)
             self._loop.call_soon_threadsafe(self._on_data, data, self.peername)
 
     def _handle_close(self):
         """Handle connection close on the asyncio loop."""
         if not self._closed:
             self._closed = True
+            _lib.usrsctp_close(self._sock)
             self._on_close(self)
 
     def send(self, data: bytes) -> None:
