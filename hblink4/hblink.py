@@ -42,6 +42,8 @@ ROAMING_REPLAY_MAX = 200      # packets kept per call until its DMRK, to replay 
 
 
 UNIT_DATA_DUP_S = 1.0       # the same unit data burst from a second peer within this is a duplicate
+VOTE_HOLD_MS = 150          # global.voting: how long a voted burst waits for the slower receivers' copies
+VOTE_JOIN_S = 1.0           # a copy of a call joins its vote if that vote heard anything this recently
 SENT_AS_KEEP_S = 60.0       # how long what we sent as a source is remembered (_sent_as)
 SENT_AS_SLACK_S = 3.0       # clock and burst-timing slack around it
 
@@ -101,6 +103,7 @@ try:
     )
     from .unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS, \
         BUSY_REASONS, BUSY_POLL_S
+    from .voting import Vote
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from constants import (
@@ -136,6 +139,7 @@ except ImportError:
     )
     from unit_data import UnitDataTx, parse_response, sack_missing, NO_RETRY_REASONS, MAX_KEPT_PACKETS, \
         BUSY_REASONS, BUSY_POLL_S
+    from voting import Vote
 
 # Data classes moved to models.py
 
@@ -164,6 +168,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Unit data bursts that started a stream lately, by (src, dst, decoded content): the same burst heard
         # by a second peer (an SDR and a roamer on one channel) isn't forwarded twice (UNIT_DATA_DUP_S).
         self._unit_data_seen: Dict[Tuple[int, int, bytes], Tuple[float, bytes]] = {}
+        # global.voting: one voice call heard by several peers, keyed (rf_src, network dst, unit call)
+        self._votes: Dict[Tuple[bytes, bytes, bool], Vote] = {}
         self._roaming_turn = 0                                # counts calls given to roamers
         
         # Outbound connection state management (Phase 2)
@@ -1682,6 +1688,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                                                    current_time, stream_timeout, hang_time):
                     outbound.slot2_stream = None
 
+        self._vote_cleanup(current_time, stream_timeout)
+
         # Cleanup old denied stream entries (older than 10 seconds)
         denied_cutoff = current_time - 10.0
         self._denied_streams = {k: v for k, v in self._denied_streams.items() if v > denied_cutoff}
@@ -2360,6 +2368,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         # heard back by a receiver at the site we're sending it at, goes nowhere.
         heard_on = self._peer_channel(rid_to_int(repeater.repeater_id))
         echo = self._our_echo(repeater, rf_src, net_dst_id)
+        if echo is None and self._vote_join(repeater, slot, rf_src, dst_id, net_dst_id, stream_id, False):
+            return True
         if echo is not None:
             target_repeaters = set()
         else:
@@ -2386,6 +2396,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         self._stamp_channel(new_stream, heard_on)
 
         repeater.set_slot_stream(slot, new_stream)
+        if echo is None:
+            self._vote_start(new_stream, net_dst_id, heard_on)
         
         # Log stream start with fast talkgroup switch indicator and target count
         ts_tg = fmt_ts_tg(net_slot, net_dst_id, slot, dst_id)
@@ -2462,6 +2474,10 @@ class HBProtocol(asyncio.DatagramProtocol):
                 f'UNIT CALL echo on repeater {rid_int} TS{slot}: src={src_int} → dst={dst_int} '
                 f'stream_id={stream_id.hex()} [our own call, being sent via {rid_to_int(echo)}]')
             return False
+
+        # Another peer's copy of a call already on its way: this one votes with it.
+        if self._vote_join(repeater, slot, rf_src, dst_id, dst_id, stream_id, True):
+            return True
 
         # Gate at the source: repeater must be enabled for unit calls.
         if not repeater.unit_calls_enabled:
@@ -2548,6 +2564,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         heard_on = self._peer_channel(rid_int)
         self._stamp_channel(new_stream, heard_on)
         repeater.set_slot_stream(slot, new_stream)
+        self._vote_start(new_stream, dst_id, heard_on)
 
         # Start-of-stream line mirrors the group-call format but with TS/RID in
         # place of TS/TGID and a mode annotation (one-to-one / broadcast /
@@ -2625,14 +2642,23 @@ class HBProtocol(asyncio.DatagramProtocol):
 
     def _our_echo(self, heard_by: RepeaterState, rf_src: bytes, dst_id: bytes) -> Optional[bytes]:
         """The peer we're sending `rf_src` → `dst_id` out of (or did, within
-        `stream_hang_time`), at `heard_by`'s site — so `heard_by` is hearing our
-        own transmission, not the radio — or None."""
+        `stream_hang_time`), at `heard_by`'s site — and, for a fixed peer, on
+        the frequency `heard_by` receives on when it has one (then a peer
+        without a frequency, on the network, can't be it; a roamer only ever
+        carries a call away from the talker's site, so any one at the site
+        is it) — so `heard_by` is hearing our own transmission, not the
+        radio — or None."""
         now = time()
         hang = CONFIG.get('global', {}).get('stream_hang_time', 10.0)
         place = self._place(heard_by)
+        rx = parse_freq_hz(heard_by.rx_freq)
         for r in self._repeaters.values():
             if r is heard_by or not r.tx_capable:
                 continue
+            if rx and not r.roaming:                 # a fixed peer must send where `heard_by` listens
+                tx = parse_freq_hz(r.tx_freq)
+                if not tx or not freqs_match(rx, tx):
+                    continue
             for s in (1, 2):
                 st = r.get_slot_stream(s)
                 if (st is not None and st.is_assumed and st.rf_src == rf_src and st.dst_id == dst_id
@@ -3610,6 +3636,11 @@ class HBProtocol(asyncio.DatagramProtocol):
                         current_stream.packet_count += 1
                         return True
                     return False
+                if current_stream.is_assumed and current_stream.rf_src == rf_src:
+                    # A peer we're sending the talker to hears the talker too: its own copy wins
+                    # (stream start takes it off the routing; with voting it joins the vote).
+                    return self._handle_stream_start(repeater, rf_src, dst_id, slot, stream_id,
+                                                     call_type_bit, frame_type, dtype_vseq, payload)
                 LOGGER.warning(f'Stream contention on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
                               f'existing stream (src={int.from_bytes(current_stream.rf_src, "big")}, '
                               f'dst={int.from_bytes(current_stream.dst_id, "big")}, '
@@ -4652,9 +4683,148 @@ class HBProtocol(asyncio.DatagramProtocol):
 
         return target_set
     
+    # ================================
+    # Receiver voting (global.voting)
+    # ================================
+
+    def _voting_hold(self) -> Optional[float]:
+        """global.voting's hold (seconds), or None when receivers don't vote."""
+        v = CONFIG.get('global', {}).get('voting') or {}
+        if not v.get('enabled'):
+            return None
+        return max(0.0, float(v.get('hold_ms', VOTE_HOLD_MS))) / 1000.0
+
+    def _vote_start(self, stream: StreamState, net_dst_id: bytes, heard_on: Optional[Dict[str, Any]]) -> None:
+        """A voice call's first stream: open the vote other peers' copies of it join."""
+        hold = self._voting_hold()
+        if hold is None:
+            return
+        now = time()
+        key = (stream.rf_src, net_dst_id, stream.is_unit_call)
+        vote = Vote(key, hold, now)
+        vote.ctx = SimpleNamespace(stream=stream, repeater_id=stream.repeater_id, seq=0, timer=None,
+                                   heard_freq=(heard_on or {}).get('freq'))
+        vote.join(stream.repeater_id, stream.stream_id, now)
+        stream.vote = vote
+        self._votes[key] = vote
+
+    def _vote_join(self, repeater: RepeaterState, slot: int, rf_src: bytes, dst_id: bytes, net_dst_id: bytes,
+                   stream_id: bytes, unit: bool) -> bool:
+        """`repeater` hears a call (rf_src → net_dst_id) another peer's copy of is already going out:
+        its stream joins that vote, with no routing of its own. True if it did."""
+        if self._voting_hold() is None:
+            return False
+        now = time()
+        vote = self._votes.get((rf_src, net_dst_id, unit))
+        if vote is None or vote.done or now - vote.last_activity > VOTE_JOIN_S:
+            return False
+        rid_int = rid_to_int(repeater.repeater_id)
+        rejoin = repeater.repeater_id in vote.members
+        vote.join(repeater.repeater_id, stream_id, now)
+        stream = StreamState(repeater_id=repeater.repeater_id, rf_src=rf_src, dst_id=dst_id, slot=slot,
+                             start_time=now, last_seen=now, stream_id=stream_id, packet_count=1,
+                             call_type='private' if unit else 'group', target_repeaters=set(),
+                             routing_cached=True, is_unit_call=unit, vote=vote)
+        heard_on = self._peer_channel(rid_int)
+        self._stamp_channel(stream, heard_on)
+        repeater.set_slot_stream(slot, stream)
+        dropped = self._vote_exclude(vote, repeater, heard_on)
+        first = vote.ctx.stream
+        LOGGER.info(f'{"Unit" if unit else "Group"} RX stream on repeater {rid_int} TS{slot} '
+                    f'src={bytes_to_int(rf_src)} dst={bytes_to_int(net_dst_id)} stream_id={stream_id.hex()} '
+                    f'{"rejoins" if rejoin else "joins"} the vote on the copy from '
+                    f'{rid_to_int(first.repeater_id)} (stream {first.stream_id.hex()})'
+                    + (f'; no longer sent to {", ".join(dropped)}' if dropped else ''))
+        self._emit_stream_start('repeater', rid_int, slot, rf_src, dst_id, stream_id,
+                                stream.call_type, False, heard_on=heard_on)
+        return True
+
+    def _vote_exclude(self, vote: Vote, member: RepeaterState, heard_on: Dict[str, Any]) -> List[str]:
+        """Targets the call mustn't go to now that `member` hears it too: the member itself (a
+        repeater repeats its own copy), and, at the member's site, a peer transmitting on the
+        channel the member hears the talker on (a roamer carrying a group call does so on the
+        call's channel)."""
+        targets = vote.ctx.stream.target_repeaters
+        if not targets:
+            return []
+        out = set()
+        if member.repeater_id in targets:
+            out.add(member.repeater_id)
+        freq = heard_on.get('freq')
+        if freq is not None:
+            place = self._place(member)
+            for t in targets:
+                tr = self._repeaters.get(t) if isinstance(t, bytes) else None
+                if tr is None or not self._at_site(tr, place):
+                    continue
+                tx = vote.ctx.heard_freq if tr.roaming and not vote.ctx.stream.is_unit_call else (
+                    None if tr.roaming else parse_freq_hz(tr.tx_freq))
+                if tx is not None and freqs_match(freq, tx):
+                    out.add(t)
+        targets.difference_update(out)
+        return [str(rid_to_int(t)) for t in out]
+
+    def _vote_feed(self, vote: Vote, repeater_id: bytes, data: bytes, frame_type: int, dtype_vseq: int,
+                   terminator: bool) -> None:
+        self._vote_send(vote, vote.add(repeater_id, data, frame_type, dtype_vseq, terminator, time()))
+
+    def _vote_poll(self, vote: Vote) -> None:
+        vote.ctx.timer = None
+        self._vote_send(vote, vote.poll(time()))
+
+    def _vote_send(self, vote: Vote, out: List[Tuple[bytes, bool, bytes]]) -> None:
+        """Forward what the vote gives, as its first stream's packets (that stream's peer, stream
+        id, slot and addressing; a sequence of its own), and set the timer for what comes due."""
+        ctx = vote.ctx
+        st = ctx.stream
+        for packet, end, _peer in out:
+            buf = bytearray(packet)
+            buf[4] = ctx.seq & 0xFF
+            ctx.seq += 1
+            buf[5:8], buf[8:11] = st.rf_src, st.dst_id
+            buf[11:15], buf[16:20] = ctx.repeater_id, st.stream_id
+            buf[15] = (buf[15] & 0x7F) | (0x80 if st.slot == 2 else 0)
+            self._forward_stream(bytes(buf), ctx.repeater_id, st.slot, st.rf_src, st.dst_id, st.stream_id,
+                                 end_of_stream=end, source_stream=st)
+        if vote.done:
+            self._vote_close(vote)
+            return
+        due = vote.next_deadline()
+        if due is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return                                   # tests poll by hand
+        if ctx.timer is not None:
+            ctx.timer.cancel()
+        ctx.timer = loop.call_later(max(0.0, due - time()), self._vote_poll, vote)
+
+    def _vote_close(self, vote: Vote) -> None:
+        if vote.ctx.timer is not None:
+            vote.ctx.timer.cancel()
+            vote.ctx.timer = None
+        if self._votes.get(vote.key) is vote:
+            del self._votes[vote.key]
+        if len(vote.members) > 1:
+            src, dst, unit = vote.key
+            LOGGER.info(f'Vote on {"unit" if unit else "group"} call src={bytes_to_int(src)} '
+                        f'dst={bytes_to_int(dst)}: {vote.summary()}')
+
+    def _vote_cleanup(self, now: float, stream_timeout: float) -> None:
+        """Votes whose peers all went quiet (no terminator): send what's left, then close."""
+        for vote in list(self._votes.values()):
+            if vote.done:
+                self._vote_close(vote)
+            elif now - vote.last_activity > stream_timeout:
+                vote.hold_s = 0.0
+                out = vote.poll(now)
+                vote.done = True
+                self._vote_send(vote, out)               # closes it
+
     def _forward_stream(self, data: bytes, source_repeater_id: bytes, slot: int,
                        rf_src: bytes, dst_id: bytes, stream_id: bytes,
-                       end_of_stream: bool = False) -> None:
+                       end_of_stream: bool = False, source_stream: Optional[StreamState] = None) -> None:
         """
         Forward DMR stream to target repeaters using cached routing.
 
@@ -4683,13 +4853,16 @@ class HBProtocol(asyncio.DatagramProtocol):
             stream_id: Unique stream identifier (4 bytes)
             end_of_stream: This packet ends the stream though it isn't a
                 terminator (the last block of a data transaction)
+            source_stream: The stream whose routing to use (a vote's: it
+                may have ended on its own peer while others still hear the call)
         """
         # Get source repeater's stream (which has the routing cache)
         source_repeater = self._repeaters.get(source_repeater_id)
         if not source_repeater:
             return
 
-        source_stream = source_repeater.get_slot_stream(slot)
+        if source_stream is None:
+            source_stream = source_repeater.get_slot_stream(slot)
         if not source_stream or source_stream.stream_id != stream_id:
             # This shouldn't happen, but safety check
             LOGGER.warning(f'Forwarding called but no matching stream found')
@@ -4989,7 +5162,10 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Stream end detection: terminator (primary) or timeout (fallback)
         # Hang time prevents slot hijacking during conversations
         
-        # Forward DMR data to other connected repeaters
+        # Forward DMR data to other connected repeaters (through the vote, when receivers vote)
+        if current_stream is not None and current_stream.vote is not None:
+            self._vote_feed(current_stream.vote, repeater_id, data, _frame_type, _dtype_vseq, _is_terminator)
+            return
         self._forward_stream(data, repeater_id, _slot, _rf_src, _dst_id, _stream_id)
 
     @staticmethod

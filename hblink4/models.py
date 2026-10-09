@@ -125,6 +125,9 @@ class StreamState:
     # A selective ACK response: the packet it answers, and its flag blocks as they come.
     sack_for: Any = None
     sack_blocks: Optional[list] = None
+    # global.voting: the vote this voice stream's packets go through (voting.Vote), when receivers
+    # vote; its first stream's routing carries the call, the others add their copies.
+    vote: Any = None
 
     # DMR Link Control for outbound rewrites under translation.
     #
