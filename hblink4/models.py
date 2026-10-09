@@ -51,6 +51,10 @@ class OutboundConnectionConfig:
     unit_calls_enabled: bool = False
     # Transport protocol: "udp" (default) or "sctp"
     transport: str = "udp"
+    # SCTP only: "udp" or "raw" for this link (None: global.sctp_encap), and
+    # the server's UDP encapsulation port (None: global.sctp_encap_port)
+    sctp_encap: Optional[str] = None
+    sctp_encap_port: Optional[int] = None
 
     # Metadata fields with defaults
     callsign: str = ""
@@ -77,6 +81,13 @@ class OutboundConnectionConfig:
             raise ValueError(f"Outbound connection '{self.name}' must have a passphrase")
         if self.port <= 0 or self.port > 65535:
             raise ValueError(f"Outbound connection '{self.name}' has invalid port: {self.port}")
+        if self.sctp_encap is not None and self.sctp_encap not in ('udp', 'raw'):
+            raise ValueError(f"Outbound connection '{self.name}' has invalid sctp_encap: "
+                             f"{self.sctp_encap!r} (use \"udp\" or \"raw\")")
+        if self.sctp_encap_port is not None and not (
+                isinstance(self.sctp_encap_port, int) and 0 < self.sctp_encap_port <= 65535):
+            raise ValueError(f"Outbound connection '{self.name}' has invalid sctp_encap_port: "
+                             f"{self.sctp_encap_port!r}")
 
 
 @dataclass

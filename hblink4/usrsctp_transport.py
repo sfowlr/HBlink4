@@ -1,17 +1,21 @@
 """
 Userspace SCTP transport via libusrsctp (ctypes).
 
-Provides SCTP on platforms without kernel support (macOS).  Uses the same
-usrsctp library that Chrome/Firefox use for WebRTC data channels.
+Provides SCTP over UDP encapsulation (RFC 6951) on any platform, and plain
+SCTP where there's no kernel SCTP (macOS, as root).  Uses the same usrsctp
+library that Chrome/Firefox use for WebRTC data channels.
 
-Install: ``brew install libusrsctp`` (macOS) or ``apt install libusrsctp-dev`` (Linux).
+Install: ``brew install libusrsctp`` (macOS) or ``apt install libusrsctp2``
+(Linux).  A copy in the virtualenv's ``lib/`` is found too.
 
-When kernel SCTP is available (Linux), this module is not loaded — the kernel
-path in sctp.py is used instead.  This module only activates as a fallback.
+With ``sctp_encap: "udp"`` this backend carries the UDP-encapsulated
+associations on Linux as well; the kernel's SCTP (sctp.py) still takes plain
+SCTP alongside it.
 """
 
 import asyncio
 import ctypes
+import errno
 import ctypes.util
 import logging
 import os
@@ -49,13 +53,19 @@ def _find_libusrsctp() -> Optional[str]:
     if path:
         return path
 
-    # Homebrew paths (Apple Silicon and Intel)
+    # A copy in the virtualenv (sys.prefix/lib), then Homebrew paths
+    # (Apple Silicon and Intel) and the distributions' library directories.
     candidates = [
+        os.path.join(sys.prefix, 'lib', 'libusrsctp.dylib'),
+        os.path.join(sys.prefix, 'lib', 'libusrsctp.so.2'),
+        os.path.join(sys.prefix, 'lib', 'libusrsctp.so'),
         '/opt/homebrew/lib/libusrsctp.dylib',
         '/usr/local/lib/libusrsctp.dylib',
         '/usr/lib/libusrsctp.so',
         '/usr/lib/x86_64-linux-gnu/libusrsctp.so',
         '/usr/lib/aarch64-linux-gnu/libusrsctp.so',
+        '/usr/lib/x86_64-linux-gnu/libusrsctp.so.2',
+        '/usr/lib/aarch64-linux-gnu/libusrsctp.so.2',
     ]
     for candidate in candidates:
         if os.path.exists(candidate):
@@ -69,7 +79,7 @@ def _load_libusrsctp() -> Optional[CDLL]:
     if path is None:
         return None
     try:
-        return CDLL(path)
+        return CDLL(path, use_errno=True)
     except OSError:
         return None
 
@@ -82,8 +92,15 @@ USRSCTP_AVAILABLE = _lib is not None
 # ---------------------------------------------------------------------------
 
 IPPROTO_SCTP = 132
+SCTP_RTOINFO = 0x00000001
 SCTP_NODELAY = 0x00000004
+SCTP_REMOTE_UDP_ENCAPS_PORT = 0x00000024
 SCTP_SENDV_NOINFO = 0
+SCTP_SENDV_PRINFO = 2
+SCTP_PR_SCTP_TTL = 0x0001
+SCTP_EVENT_READ = 0x0001
+SCTP_EVENT_WRITE = 0x0002
+SCTP_EVENT_ERROR = 0x0004
 MSG_NOTIFICATION = 0x2000
 MSG_EOR = 0x8
 
@@ -141,6 +158,33 @@ class SctpRcvinfo(ctypes.Structure):
     ]
 
 
+class SctpRtoinfo(ctypes.Structure):
+    """struct sctp_rtoinfo (milliseconds)."""
+    _fields_ = [
+        ('srto_assoc_id', c_uint32),
+        ('srto_initial', c_uint32),
+        ('srto_max', c_uint32),
+        ('srto_min', c_uint32),
+    ]
+
+
+class SctpUdpencaps(ctypes.Structure):
+    """struct sctp_udpencaps: sockaddr_storage (128 bytes, 8-aligned), assoc id, port (network order)."""
+    _fields_ = [
+        ('sue_address', ctypes.c_uint64 * 16),
+        ('sue_assoc_id', c_uint32),
+        ('sue_port', c_uint16),
+    ]
+
+
+class SctpPrinfo(ctypes.Structure):
+    """struct sctp_prinfo: the PR-SCTP policy and its value (TTL: milliseconds)."""
+    _fields_ = [
+        ('pr_policy', c_uint16),
+        ('pr_value', c_uint32),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Callback types
 # ---------------------------------------------------------------------------
@@ -163,6 +207,7 @@ UPCALL_CB = CFUNCTYPE(None, c_void_p, c_void_p, c_int)
 
 _initialized = False
 _init_lock = threading.Lock()
+_encap_port: Optional[int] = None  # the UDP port usrsctp was initialized with
 
 
 def _debug_printf(fmt):
@@ -185,8 +230,11 @@ def _init_usrsctp(udp_encap_port: int = 9899):
     Args:
         udp_encap_port: UDP encapsulation port.  0 = raw IP (requires root on macOS).
     """
-    global _initialized
+    global _initialized, _encap_port
     if _initialized:
+        if udp_encap_port != _encap_port:
+            LOGGER.warning(f'usrsctp already initialized with encap_port={_encap_port}; '
+                           f'ignoring {udp_encap_port}')
         return
     with _init_lock:
         if _initialized:
@@ -194,16 +242,18 @@ def _init_usrsctp(udp_encap_port: int = 9899):
         # conn_output=NULL means usrsctp manages its own UDP encapsulation
         _lib.usrsctp_init(c_uint16(udp_encap_port), None, _debug_cb)
         _initialized = True
+        _encap_port = udp_encap_port
         LOGGER.info(f'usrsctp initialized (encap_port={udp_encap_port})')
 
 
 def shutdown_usrsctp():
     """Shutdown the usrsctp library. Call once at process exit."""
-    global _initialized
+    global _initialized, _encap_port
     if not _initialized:
         return
     _lib.usrsctp_finish()
     _initialized = False
+    _encap_port = None
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +357,9 @@ if _lib is not None:
     _lib.usrsctp_setsockopt.restype = c_int
     _lib.usrsctp_setsockopt.argtypes = [c_void_p, c_int, c_int, c_void_p, ctypes.c_uint32]
 
+    _lib.usrsctp_getsockopt.restype = c_int
+    _lib.usrsctp_getsockopt.argtypes = [c_void_p, c_int, c_int, c_void_p, POINTER(ctypes.c_uint32)]
+
     _lib.usrsctp_set_non_blocking.restype = c_int
     _lib.usrsctp_set_non_blocking.argtypes = [c_void_p, c_int]
 
@@ -318,22 +371,76 @@ if _lib is not None:
 
 
 # ---------------------------------------------------------------------------
+# Socket options
+# ---------------------------------------------------------------------------
+
+def set_rto(sock_ptr, rto: Tuple[int, int, int]) -> bool:
+    """Set the retransmission timeout bounds (initial, min, max) in ms.
+
+    On a listening socket this sets the defaults its associations get.
+    """
+    initial, rto_min, rto_max = rto
+    info = SctpRtoinfo(0, initial, rto_max, rto_min)
+    rc = _lib.usrsctp_setsockopt(sock_ptr, IPPROTO_SCTP, SCTP_RTOINFO, byref(info), sizeof(info))
+    if rc < 0:
+        LOGGER.warning(f'usrsctp: failed to set SCTP_RTOINFO {rto}')
+        return False
+    return True
+
+
+def get_rto(sock_ptr) -> Optional[Tuple[int, int, int]]:
+    """The socket's (initial, min, max) RTO in ms, or None."""
+    info = SctpRtoinfo()
+    size = ctypes.c_uint32(sizeof(info))
+    if _lib.usrsctp_getsockopt(sock_ptr, IPPROTO_SCTP, SCTP_RTOINFO, byref(info), byref(size)) < 0:
+        return None
+    return (info.srto_initial, info.srto_min, info.srto_max)
+
+
+def set_remote_encap_port(sock_ptr, port: int) -> bool:
+    """Send this socket's associations to the peer's UDP port *port*.
+
+    usrsctp learns an inbound peer's UDP port from its packets, but for an
+    association we start it must be told, or it sends plain SCTP over IP.
+    """
+    encaps = SctpUdpencaps()
+    encaps.sue_port = socket.htons(port)
+    rc = _lib.usrsctp_setsockopt(sock_ptr, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT,
+                                 byref(encaps), sizeof(encaps))
+    if rc < 0:
+        LOGGER.warning(f'usrsctp: failed to set the remote UDP encapsulation port {port}')
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # UsrsctpSocket: wraps one usrsctp association
 # ---------------------------------------------------------------------------
 
 class UsrsctpSocket:
-    """Wraps a single usrsctp socket with send/recv/close operations."""
+    """Wraps a single usrsctp socket with send/recv/close operations.
+
+    *dmrd_ttl_ms* > 0 sends DMRD (voice) with a PR-SCTP timed lifetime: a
+    burst that can't get through within that long is given up rather than
+    holding up the ones behind it.  Everything else stays reliable.
+    """
 
     def __init__(self, sock_ptr: c_void_p, peername: Tuple[str, int],
                  loop: asyncio.AbstractEventLoop,
                  on_data: Callable[[bytes, Tuple[str, int]], None],
-                 on_close: Callable[['UsrsctpSocket'], None]):
+                 on_close: Callable[['UsrsctpSocket'], None],
+                 dmrd_ttl_ms: int = 0):
         self._sock = sock_ptr
         self.peername = peername
         self._loop = loop
         self._on_data = on_data
         self._on_close = on_close
         self._closed = False
+        self.dmrd_ttl_ms = dmrd_ttl_ms
+        # Built once: the hot path only passes a reference
+        self._prinfo = SctpPrinfo(SCTP_PR_SCTP_TTL, dmrd_ttl_ms)
+        self._prinfo_ref = byref(self._prinfo)
+        self._prinfo_len = ctypes.c_uint32(sizeof(self._prinfo))
 
         # Set NODELAY
         on = c_int(1)
@@ -400,14 +507,24 @@ class UsrsctpSocket:
         """Send data over this SCTP association. Thread-safe."""
         if self._closed:
             return
-        n = _lib.usrsctp_sendv(
-            self._sock,
-            data, c_size_t(len(data)),
-            None, c_int(0),      # no destination (connected socket)
-            None, ctypes.c_uint32(0),  # no sndinfo
-            c_uint32(SCTP_SENDV_NOINFO),
-            c_int(0)
-        )
+        if self.dmrd_ttl_ms and data.startswith(b'DMRD'):
+            n = _lib.usrsctp_sendv(
+                self._sock,
+                data, len(data),
+                None, 0,             # no destination (connected socket)
+                self._prinfo_ref, self._prinfo_len,
+                SCTP_SENDV_PRINFO,
+                0
+            )
+        else:
+            n = _lib.usrsctp_sendv(
+                self._sock,
+                data, len(data),
+                None, 0,             # no destination (connected socket)
+                None, 0,             # no sndinfo
+                SCTP_SENDV_NOINFO,
+                0
+            )
         if n < 0:
             LOGGER.warning(f'usrsctp_sendv failed for {self.peername}')
 
@@ -502,10 +619,12 @@ class UsrsctpListener:
     """
 
     def __init__(self, hbprotocol: 'HBProtocol', bind_addr: str, port: int,
-                 loop: asyncio.AbstractEventLoop, encap_port: int = 9899):
+                 loop: asyncio.AbstractEventLoop, encap_port: int = 9899,
+                 rto: Optional[Tuple[int, int, int]] = None, dmrd_ttl_ms: int = 0):
         self.hbprotocol = hbprotocol
         self.bind_addr = bind_addr
         self.port = port
+        self.dmrd_ttl_ms = dmrd_ttl_ms
         self._loop = loop
         self._listen_sock = None
         self._accept_thread = None
@@ -530,6 +649,9 @@ class UsrsctpListener:
         _lib.usrsctp_setsockopt(
             self._listen_sock, IPPROTO_SCTP, SCTP_NODELAY, byref(on), sizeof(on)
         )
+        # Retransmission timeouts the accepted associations start with
+        if rto is not None:
+            set_rto(self._listen_sock, rto)
 
         # Bind
         sa = _make_sockaddr(bind_addr, port)
@@ -588,7 +710,8 @@ class UsrsctpListener:
             if proto:
                 proto.connection_lost()
 
-        usrsctp_sock = UsrsctpSocket(sock_ptr, peername, self._loop, on_data, on_close)
+        usrsctp_sock = UsrsctpSocket(sock_ptr, peername, self._loop, on_data, on_close,
+                                     dmrd_ttl_ms=self.dmrd_ttl_ms)
         proto = UsrsctpInboundProtocol(self.hbprotocol, usrsctp_sock)
         self._connections[normalize_addr(peername)] = proto
 
@@ -609,9 +732,15 @@ class UsrsctpListener:
 
 async def usrsctp_connect(hbprotocol: 'HBProtocol', connection_name: str,
                           ip: str, port: int, encap_port: int = 9899,
+                          remote_encap_port: Optional[int] = None,
+                          rto: Optional[Tuple[int, int, int]] = None,
+                          dmrd_ttl_ms: int = 0,
+                          timeout: float = 15.0,
                           ) -> Tuple[UsrsctpOutboundProtocol, Callable[[bytes], None]]:
     """Create an outbound usrsctp connection.
 
+    *encap_port* is our UDP port (0: plain SCTP over IP); *remote_encap_port*
+    the server's, by default the same.  Gives up after *timeout* seconds.
     Returns (protocol_adapter, send_callable).
     """
     loop = asyncio.get_running_loop()
@@ -626,15 +755,35 @@ async def usrsctp_connect(hbprotocol: 'HBProtocol', connection_name: str,
     if not sock_ptr:
         raise OSError(f'Failed to create usrsctp socket for {connection_name}')
 
-    # Connect (blocking in thread to not block asyncio)
+    if rto is not None:
+        set_rto(sock_ptr, rto)
+    if encap_port:
+        set_remote_encap_port(sock_ptr, remote_encap_port or encap_port)
+
+    # Connect without blocking: start it, then poll the socket's events until
+    # it's writable (up) or has an error, so a peer that never answers can't
+    # hold a thread or the reconnect loop.
     sa = _make_sockaddr(ip, port)
-
-    def _do_connect():
+    try:
+        _lib.usrsctp_set_non_blocking(sock_ptr, 1)
         rc = _lib.usrsctp_connect(sock_ptr, byref(sa), sizeof(sa))
-        if rc < 0 and ctypes.get_errno() != 115:  # EINPROGRESS
-            raise OSError(f'usrsctp_connect failed for {ip}:{port}')
-
-    await loop.run_in_executor(None, _do_connect)
+        if rc < 0:
+            err = ctypes.get_errno()
+            if err != errno.EINPROGRESS:
+                raise OSError(err, f'usrsctp_connect failed for {ip}:{port}: {os.strerror(err)}')
+        deadline = loop.time() + timeout
+        while True:
+            events = _lib.usrsctp_get_events(sock_ptr)
+            if events & SCTP_EVENT_ERROR:
+                raise OSError(f'usrsctp_connect failed for {ip}:{port}')
+            if events & SCTP_EVENT_WRITE:
+                break
+            if loop.time() >= deadline:
+                raise TimeoutError(f'usrsctp_connect to {ip}:{port}: no answer in {timeout:g} s')
+            await asyncio.sleep(0.02)
+    except BaseException:
+        _lib.usrsctp_close(sock_ptr)
+        raise
 
     # Wrap in UsrsctpSocket
     def on_data(data: bytes, addr: Tuple[str, int]):
@@ -643,7 +792,8 @@ async def usrsctp_connect(hbprotocol: 'HBProtocol', connection_name: str,
     def on_close(usrsctp_sock: UsrsctpSocket):
         proto.connection_lost()
 
-    usrsctp_sock = UsrsctpSocket(sock_ptr, (ip, port), loop, on_data, on_close)
+    usrsctp_sock = UsrsctpSocket(sock_ptr, (ip, port), loop, on_data, on_close,
+                                 dmrd_ttl_ms=dmrd_ttl_ms)
     proto = UsrsctpOutboundProtocol(hbprotocol, connection_name, usrsctp_sock)
 
     return proto, usrsctp_sock.send

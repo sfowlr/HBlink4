@@ -38,7 +38,13 @@ The `global` section contains server-wide settings that control the basic operat
         },
         "sctp_enabled": false,
         "sctp_port_ipv4": 62031,
-        "sctp_port_ipv6": 62031
+        "sctp_port_ipv6": 62031,
+        "sctp_encap": "udp",
+        "sctp_encap_port": 9899,
+        "sctp_rto_initial_ms": 1000,
+        "sctp_rto_min_ms": 200,
+        "sctp_rto_max_ms": 5000,
+        "sctp_ttl_ms": 0
     }
 }
 ```
@@ -52,9 +58,15 @@ The `global` section contains server-wide settings that control the basic operat
 | `bind_ipv6` | string | IPv6 address to bind ("::" for all IPv6 interfaces) |
 | `port_ipv4` | number | UDP port for IPv4 (default: 62031) |
 | `port_ipv6` | number | UDP port for IPv6 (default: 62031) |
-| `sctp_enabled` | boolean | Enable SCTP listeners alongside UDP (default: false). Requires Linux kernel SCTP support (`modprobe sctp`). Falls back to UDP-only if unavailable. |
+| `sctp_enabled` | boolean | Enable SCTP listeners alongside UDP (default: false). Needs the Linux kernel's SCTP (`modprobe sctp`) for plain SCTP, libusrsctp for SCTP over UDP. Falls back to UDP-only if neither is there. See "SCTP Transport" |
 | `sctp_port_ipv4` | number | SCTP port for IPv4 (default: same as `port_ipv4`). Can be the same as the UDP port since they're different protocols. |
 | `sctp_port_ipv6` | number | SCTP port for IPv6 (default: same as `port_ipv6`) |
+| `sctp_encap` | string | `"udp"` (default): accept SCTP over UDP (RFC 6951) on `sctp_encap_port` with libusrsctp, and plain SCTP from the kernel too where it has SCTP. `"raw"`: plain SCTP only |
+| `sctp_encap_port` | number | UDP port for SCTP over UDP (default: 9899, as MMDVMHost) |
+| `sctp_rto_initial_ms` | number | SCTP retransmission timeout before a round trip has been measured (default: 1000) |
+| `sctp_rto_min_ms` | number | Shortest SCTP retransmission timeout (default: 200; RFC 9260's 1000 is slow for voice over Wi-Fi) |
+| `sctp_rto_max_ms` | number | Longest SCTP retransmission timeout, the cap on backoff during an outage (default: 5000). Needs min ≤ initial ≤ max, else all three take their defaults |
+| `sctp_ttl_ms` | number | PR-SCTP lifetime of the DMRD (voice and data bursts) HBlink4 sends over SCTP over UDP: one that can't get through in this long is given up instead of holding up the ones behind it, as MMDVMHost's `SCTPTTL`. Login, keepalives, DMRC and everything else stay reliable. 0 (default): reliable. usrsctp associations only |
 | `logging.file` | string | Path to log file |
 | `logging.console_level` | string | Logging level for console output ("DEBUG", "INFO", "WARNING", "ERROR") |
 | `logging.file_level` | string | Logging level for file output ("DEBUG", "INFO", "WARNING", "ERROR") |
@@ -177,12 +189,28 @@ HBlink4 can optionally listen for inbound connections via **SCTP** (Stream Contr
 
 - **Message boundaries preserved** (like UDP) — no framing or reassembly needed
 - **Connection-oriented** (like TCP) — connection_made/connection_lost lifecycle
-- **Built-in heartbeat detection** — kernel detects dead peers automatically
+- **Built-in heartbeat detection** — dead peers are detected by SCTP itself
+- **Retransmission** — lost packets are sent again, with an optional lifetime for voice (`sctp_ttl_ms`)
 - **SCTP_NODELAY** always enabled — no Nagle buffering of small DMR packets
 
+**Two ways in, two backends:**
+
+| `sctp_encap` | Plain SCTP (IP protocol 132) | SCTP over UDP on `sctp_encap_port` |
+|---|---|---|
+| `"udp"` (default) | Linux kernel, where it has SCTP | libusrsctp (any platform) |
+| `"raw"` | Linux kernel; else libusrsctp as root | — |
+
+SCTP over UDP (RFC 6951) gets through NAT and firewalls that drop other IP protocols, and is what small clients use (MMDVMHost's SCTP, the RadioDesk ESP32 firmware). The Linux kernel only accepts it with `sysctl net.sctp.udp_port` (5.11+), which HBlink4 doesn't need or use: it runs SCTP over UDP in userspace with libusrsctp.
+
+With `"udp"` on Linux both run side by side: the kernel listens for plain SCTP on `sctp_port_ipv4`/`_ipv6`, and libusrsctp takes SCTP in UDP datagrams on `sctp_encap_port`. They don't share a port. Two things are exclusive with it:
+
+- `net.sctp.udp_port` set to the same port: the kernel then holds that UDP port and usrsctp can't bind it. Leave it 0.
+- Running HBlink4 as **root**: usrsctp then also opens raw SCTP sockets and sees the kernel's plain SCTP traffic. Run it as an ordinary user (the systemd unit does), or use `"raw"`. HBlink4 warns at startup.
+
 **Requirements:**
-- Linux kernel with SCTP support: `sudo modprobe sctp`
-- macOS does **not** support SCTP — the server logs a warning and continues UDP-only
+- Plain SCTP: Linux kernel with SCTP support: `sudo modprobe sctp`
+- SCTP over UDP: libusrsctp: `apt install libusrsctp2` (Debian/Ubuntu) or `brew install libusrsctp` (macOS). A copy in the virtualenv's `lib/` (e.g. `venv/lib/libusrsctp.so.2`) is found too. Without it, `"udp"` falls back to plain SCTP with a warning
+- macOS has no kernel SCTP: SCTP over UDP with libusrsctp, or plain SCTP with libusrsctp as root
 - The connecting client (MMDVMHost) must also support SCTP
 
 **Configuration:**
@@ -191,12 +219,21 @@ HBlink4 can optionally listen for inbound connections via **SCTP** (Stream Contr
     "global": {
         "sctp_enabled": true,
         "sctp_port_ipv4": 62031,
-        "sctp_port_ipv6": 62031
+        "sctp_port_ipv6": 62031,
+        "sctp_encap": "udp",
+        "sctp_encap_port": 9899,
+        "sctp_rto_min_ms": 200,
+        "sctp_rto_max_ms": 5000,
+        "sctp_ttl_ms": 0
     }
 }
 ```
 
-SCTP and UDP listeners run simultaneously — repeaters can connect via either protocol. SCTP ports can be the same as UDP ports since they are different protocols and don't conflict.
+SCTP and UDP listeners run simultaneously — repeaters can connect via either protocol. SCTP ports can be the same as UDP ports since they are different protocols and don't conflict. The SCTP-over-UDP port (`sctp_encap_port`) must differ from the HomeBrew UDP ports.
+
+**Timeouts.** A packet that isn't acknowledged is sent again after the retransmission timeout (RTO), which SCTP works out from the measured round trip and keeps between `sctp_rto_min_ms` and `sctp_rto_max_ms`, doubling it after each timeout. RFC 9260's minimum of 1 s holds a lost voice burst up for a second; HBlink4 defaults to 200 ms and caps backoff at 5 s, so a link coming back after a Wi-Fi dropout is used again within seconds. The settings apply to both backends and to outbound links.
+
+**Voice lifetime.** With `sctp_ttl_ms` set, a DMRD HBlink4 sends over SCTP over UDP carries a PR-SCTP (RFC 3758) timed lifetime: if it hasn't got through within that time, it's dropped and the peer is told to skip it, so a late burst doesn't delay the live ones after it. HomeBrew control traffic stays reliable. The peer must support PR-SCTP (usrsctp and the RadioDesk firmware do); otherwise everything stays reliable. Plain SCTP through the kernel is always reliable. 0 (default) keeps every DMRD reliable, like MMDVMHost's `SCTPTTL` default.
 
 For outbound connections, set `"transport": "sctp"` on the individual connection:
 ```json
@@ -207,13 +244,17 @@ For outbound connections, set `"transport": "sctp"` on the individual connection
             "address": "master.example.com",
             "port": 62031,
             "transport": "sctp",
+            "sctp_encap": "udp",
+            "sctp_encap_port": 9899,
             ...
         }
     ]
 }
 ```
 
-> ℹ️ **Application-level keepalives (RPTPING/MSTPONG) are still used with SCTP.** The HomeBrew protocol state machine requires them regardless of transport. SCTP heartbeats provide an additional layer of dead-peer detection at the kernel level.
+An outbound link uses SCTP over UDP to the server's `sctp_encap_port` when `sctp_encap` is `"udp"` (libusrsctp; plain SCTP if it's missing), and plain SCTP when it's `"raw"` (the kernel, else libusrsctp as root). `sctp_encap` and `sctp_encap_port` on the link override the global ones; usrsctp sends from the global `sctp_encap_port`.
+
+> ℹ️ **Application-level keepalives (RPTPING/MSTPONG) are still used with SCTP.** The HomeBrew protocol state machine requires them regardless of transport. SCTP heartbeats provide an additional layer of dead-peer detection.
 
 ## Dashboard Configuration
 
@@ -849,7 +890,9 @@ These fields are sent to the remote server during the RPTC (configuration) hands
 | `software_id` | string | `"HBlink4"` | Software identifier |
 | `package_id` | string | `"HBlink4 v2.0"` | Package version |
 | `unit_calls_enabled` | boolean | `false` | Whether unit (private) calls traverse this outbound link. When `true`, local unit calls fan out over this link and unit calls arriving on it are forwarded to local repeaters. When `false`, unit calls are dropped at the link boundary. Set to `true` only for peers that participate in unit-call routing (e.g. other HBlink4 servers). |
-| `transport` | string | `"udp"` | Transport protocol: `"udp"` (default) or `"sctp"`. SCTP requires Linux kernel support on both ends. The remote server must also be listening on SCTP. |
+| `transport` | string | `"udp"` | Transport protocol: `"udp"` (default) or `"sctp"`. The remote server must also be listening on SCTP. See "SCTP Transport" |
+| `sctp_encap` | string | global `sctp_encap` | SCTP only: `"udp"` (SCTP over UDP, libusrsctp) or `"raw"` (plain SCTP) to this server |
+| `sctp_encap_port` | number | global `sctp_encap_port` | SCTP over UDP only: the server's UDP port |
 
 ### Unit (Private) Call Forwarding
 

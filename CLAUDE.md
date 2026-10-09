@@ -183,7 +183,7 @@ Patterns configured in `config.json` under `connection_type_detection`.
 
 #### SCTP Transport
 
-Optional alternative to UDP, enabled via `sctp_enabled: true` in config. Linux only (macOS falls back gracefully).
+Optional alternative to UDP, enabled via `sctp_enabled: true` in config. Plain SCTP via the Linux kernel; SCTP over UDP (`sctp_encap: "udp"`, port `sctp_encap_port`) via libusrsctp (`usrsctp_transport.py`) on any platform, alongside the kernel's on Linux. RTO bounds (`sctp_rto_*_ms`) and an optional PR-SCTP lifetime for our DMRD (`sctp_ttl_ms`) are in `sctp.SCTPSettings`.
 
 - `RepeaterState.send` and `OutboundState.send` hold a `Callable[[bytes], None]` — UDP closes over `(transport, addr)`, SCTP uses `transport.write`
 - `SCTPInboundProtocol.data_received` delegates to `HBProtocol.datagram_received` — zero handler duplication
@@ -233,7 +233,8 @@ Test files in `tests/`:
 - **test_connection_type.py**: Device type categorization logic
 - **test_unit_data_delivery.py**: Unit data outcomes (routed/failed, then delivered/nacked/no_response from the radio's response packet) and the optional retry
 - **test_voting.py**: Receiver voting: line-up, waiting, best AMBE frames, gaps filled, the end; one stream out of HBlink4 for two receivers
-- **test_sctp.py**: SCTP protocol delegation, send callable patterns, availability detection (mock-based tests run everywhere; real socket tests Linux-only)
+- **test_sctp.py**: SCTP protocol delegation, send callable patterns, availability detection, settings and backend choice by `sctp_encap` (mock-based tests run everywhere; real socket tests Linux-only)
+- **test_usrsctp_transport.py**: usrsctp adapters, struct layouts, the DMRD lifetime, RTO and remote UDP port on outbound connects, and a real association over UDP in one process (needs libusrsctp)
 
 Load test configurations from `config/config_sample.json` to validate patterns work as documented.
 
@@ -324,5 +325,5 @@ Comprehensive docs in `docs/`:
 
 6. **No External Framework Dependency**: Core server uses pure asyncio. Dashboard is the only component with external framework dependency (FastAPI/Uvicorn).
 
-7. **SCTP is Linux-only**: macOS has no kernel SCTP support. When `sctp_enabled: true` on macOS, a warning is logged and the server continues UDP-only. Tests use mocks to run on all platforms.
+7. **SCTP backends**: macOS has no kernel SCTP; there SCTP needs libusrsctp (SCTP over UDP, or plain SCTP as root). Without any backend, `sctp_enabled: true` logs a warning and the server continues UDP-only. Tests use mocks to run on all platforms; the usrsctp loopback test needs libusrsctp.
 

@@ -11,6 +11,7 @@ from unittest.mock import Mock, MagicMock, patch
 
 from hblink4.sctp import (
     SCTP_AVAILABLE,
+    KERNEL_SCTP_AVAILABLE,
     IPPROTO_SCTP,
     SCTPInboundProtocol,
     SCTPOutboundProtocol,
@@ -298,11 +299,143 @@ class TestOutboundConnectionConfigTransport(unittest.TestCase):
         self.assertEqual(config.transport, 'sctp')
 
 
+class TestSCTPSettings(unittest.TestCase):
+    """global.sctp_* settings: defaults, RTO bounds, lifetime, bad values."""
+
+    def test_defaults(self):
+        from hblink4.sctp import sctp_settings
+        s = sctp_settings({})
+        self.assertEqual(s.encap, 'udp')
+        self.assertEqual(s.encap_port, 9899)
+        self.assertEqual(s.rto, (1000, 200, 5000))  # initial, min, max
+        self.assertEqual(s.ttl_ms, 0)  # DMRD reliable unless asked
+        self.assertEqual(s.usrsctp_encap_port, 9899)
+
+    def test_configured(self):
+        from hblink4.sctp import sctp_settings
+        s = sctp_settings({'sctp_encap': 'udp', 'sctp_encap_port': 9900,
+                           'sctp_rto_initial_ms': 500, 'sctp_rto_min_ms': 150,
+                           'sctp_rto_max_ms': 3000, 'sctp_ttl_ms': 300})
+        self.assertEqual(s.encap_port, 9900)
+        self.assertEqual(s.rto, (500, 150, 3000))
+        self.assertEqual(s.ttl_ms, 300)
+
+    def test_raw_has_no_udp_port(self):
+        from hblink4.sctp import sctp_settings
+        s = sctp_settings({'sctp_encap': 'raw', 'sctp_encap_port': 9899})
+        self.assertEqual(s.encap, 'raw')
+        self.assertEqual(s.usrsctp_encap_port, 0)
+
+    def test_bad_values_fall_back(self):
+        from hblink4.sctp import sctp_settings
+        with self.assertLogs('hblink4.sctp', level='WARNING'):
+            s = sctp_settings({'sctp_encap': 'tcp', 'sctp_rto_min_ms': -1,
+                               'sctp_ttl_ms': 'soon', 'sctp_encap_port': 70000})
+        self.assertEqual(s.encap, 'udp')
+        self.assertEqual(s.rto_min_ms, 200)
+        self.assertEqual(s.ttl_ms, 0)
+        self.assertEqual(s.encap_port, 9899)
+
+    def test_rto_out_of_order_falls_back(self):
+        from hblink4.sctp import sctp_settings
+        with self.assertLogs('hblink4.sctp', level='WARNING'):
+            s = sctp_settings({'sctp_rto_initial_ms': 100, 'sctp_rto_min_ms': 200,
+                               'sctp_rto_max_ms': 5000})
+        self.assertEqual(s.rto, (1000, 200, 5000))
+
+
+class TestSCTPBackendPlan(unittest.TestCase):
+    """Which backend takes which association, by sctp_encap and what's installed."""
+
+    def test_udp_listens_with_both(self):
+        from hblink4.sctp import plan_sctp_listeners
+        # Linux with kernel SCTP and libusrsctp: plain SCTP and SCTP over UDP side by side
+        self.assertEqual(plan_sctp_listeners('udp', True, True), (True, True))
+        # macOS: usrsctp only
+        self.assertEqual(plan_sctp_listeners('udp', False, True), (False, True))
+        # Linux without libusrsctp: plain SCTP only
+        self.assertEqual(plan_sctp_listeners('udp', True, False), (True, False))
+        self.assertEqual(plan_sctp_listeners('udp', False, False), (False, False))
+
+    def test_raw_prefers_kernel(self):
+        from hblink4.sctp import plan_sctp_listeners
+        self.assertEqual(plan_sctp_listeners('raw', True, True), (True, False))
+        self.assertEqual(plan_sctp_listeners('raw', False, True), (False, True))
+
+    def test_outbound(self):
+        from hblink4.sctp import plan_sctp_outbound
+        self.assertEqual(plan_sctp_outbound('udp', True, True), 'usrsctp')
+        self.assertEqual(plan_sctp_outbound('udp', True, False), 'kernel')
+        self.assertEqual(plan_sctp_outbound('raw', True, True), 'kernel')
+        self.assertEqual(plan_sctp_outbound('raw', False, True), 'usrsctp')
+        self.assertIsNone(plan_sctp_outbound('udp', False, False))
+
+
+class TestKernelRTO(unittest.TestCase):
+    """SCTP_RTOINFO on kernel sockets: struct sctp_rtoinfo is assoc id, initial, max, min."""
+
+    def test_apply_sctp_rto_packs_initial_max_min(self):
+        import struct
+        from hblink4.sctp import apply_sctp_rto, SCTP_RTOINFO
+        sock = Mock()
+        apply_sctp_rto(sock, (1000, 200, 5000))
+        sock.setsockopt.assert_called_once_with(
+            IPPROTO_SCTP, SCTP_RTOINFO, struct.pack('=iIII', 0, 1000, 5000, 200))
+
+    def test_apply_sctp_rto_failure_only_warns(self):
+        from hblink4.sctp import apply_sctp_rto
+        sock = Mock()
+        sock.setsockopt.side_effect = OSError('nope')
+        with self.assertLogs('hblink4.sctp', level='WARNING'):
+            apply_sctp_rto(sock, (1000, 200, 5000))
+
+
+class TestOutboundSCTPEncapConfig(unittest.TestCase):
+    """Per-link sctp_encap / sctp_encap_port on outbound connections."""
+
+    def _cfg(self, **kw):
+        from hblink4.models import OutboundConnectionConfig
+        return OutboundConnectionConfig(enabled=True, name='t', address='h', port=62031,
+                                        radio_id=312999, passphrase='pw', transport='sctp', **kw)
+
+    def test_defaults_to_global(self):
+        c = self._cfg()
+        self.assertIsNone(c.sctp_encap)
+        self.assertIsNone(c.sctp_encap_port)
+
+    def test_parsed_from_config(self):
+        from hblink4.config import parse_outbound_connections
+        out = parse_outbound_connections({'outbound_connections': [{
+            'name': 't', 'address': 'h', 'port': 62031, 'radio_id': 312999,
+            'passphrase': 'pw', 'transport': 'sctp', 'sctp_encap': 'udp',
+            'sctp_encap_port': 9900}]})
+        self.assertEqual(out[0].sctp_encap, 'udp')
+        self.assertEqual(out[0].sctp_encap_port, 9900)
+
+    def test_invalid_rejected(self):
+        with self.assertRaises(ValueError):
+            self._cfg(sctp_encap='tcp')
+        with self.assertRaises(ValueError):
+            self._cfg(sctp_encap_port=0)
+
+
 @unittest.skipUnless(sys.platform == 'linux', 'SCTP requires Linux kernel')
 class TestSCTPSocketCreation(unittest.TestCase):
     """Integration tests for actual SCTP socket creation — Linux only."""
 
-    @unittest.skipUnless(SCTP_AVAILABLE, 'SCTP kernel module not loaded')
+    @unittest.skipUnless(KERNEL_SCTP_AVAILABLE, 'SCTP kernel module not loaded')
+    def test_create_listen_socket_with_rto(self):
+        from hblink4.sctp import create_sctp_listen_socket, SCTP_RTOINFO
+        import struct
+        sock = create_sctp_listen_socket('127.0.0.1', 0, rto=(700, 150, 4000))
+        try:
+            raw = sock.getsockopt(IPPROTO_SCTP, SCTP_RTOINFO, 16)
+            _, initial, rto_max, rto_min = struct.unpack('=iIII', raw)
+            self.assertEqual((initial, rto_min, rto_max), (700, 150, 4000))
+        finally:
+            sock.close()
+
+    @unittest.skipUnless(KERNEL_SCTP_AVAILABLE, 'SCTP kernel module not loaded')
     def test_create_listen_socket(self):
         from hblink4.sctp import create_sctp_listen_socket
         import socket
@@ -316,7 +449,7 @@ class TestSCTPSocketCreation(unittest.TestCase):
         finally:
             sock.close()
 
-    @unittest.skipUnless(SCTP_AVAILABLE, 'SCTP kernel module not loaded')
+    @unittest.skipUnless(KERNEL_SCTP_AVAILABLE, 'SCTP kernel module not loaded')
     def test_create_connect_socket(self):
         from hblink4.sctp import create_sctp_connect_socket
         import socket
