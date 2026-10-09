@@ -18,7 +18,15 @@ from time import time
 from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass, field
 
+try:
+    from .utils import freqs_match
+except ImportError:
+    from utils import freqs_match
+
 LOGGER = logging.getLogger(__name__)
+
+# A report this close to the entry (seconds) is about the same hearing: its expiry replaces the entry's.
+SAME_REPORT_S = 30.0
 
 
 @dataclass
@@ -56,6 +64,10 @@ class UserEntry:
     # The heard-on peer's site (its pattern's `site`), or the site an external
     # report names. Unit calls to the radio go out only at this site.
     site: Optional[str] = None
+    # When the entry stops being a route (epoch seconds), as an external report
+    # said (its `expires`: the reporter knows the radio, e.g. from ARS); None =
+    # `last_heard` + the cache timeout.
+    expires_at: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization"""
@@ -75,6 +87,7 @@ class UserEntry:
             'longitude': self.longitude,
             'height': self.height,
             'site': self.site,
+            'expires_at': self.expires_at,
         }
 
 
@@ -102,13 +115,19 @@ class UserCache:
         self._timeout = timeout_seconds
         LOGGER.info(f'User cache initialized with {timeout_seconds}s timeout')
     
+    def _expires(self, entry: UserEntry) -> float:
+        return entry.expires_at if entry.expires_at is not None else entry.last_heard + self._timeout
+
+    def _expired(self, entry: UserEntry, now: float) -> bool:
+        return now > self._expires(entry)
+
     def update(self, radio_id: int, repeater_id: int, callsign: str,
                slot: int, talkgroup: int, talker_alias: Optional[str] = None,
                outbound_name: Optional[str] = None, freq: Optional[int] = None,
                colorcode: Optional[int] = None, source: str = 'voice',
                heard_at: Optional[float] = None, latitude: Optional[float] = None,
                longitude: Optional[float] = None, height: Optional[int] = None,
-               site: Optional[str] = None) -> bool:
+               site: Optional[str] = None, expires_at: Optional[float] = None) -> bool:
         """
         Update cache with user activity.
 
@@ -130,6 +149,13 @@ class UserCache:
                 already newer than this is kept. Defaults to now.
             latitude, longitude, height: Where the peer that heard it is, if known
             site: That peer's site, if it has one
+            expires_at: When it stops being a route (an external report's
+                `expires`); None = last heard + the cache timeout. A report for
+                the channel the entry already has sets the entry's expiry even
+                when the entry is newer: the radio was only heard again where
+                the reporter says it is. Within SAME_REPORT_S of the entry it
+                replaces it (a radio the reporter now counts as gone stops being
+                a route); older than that it can only extend it.
 
         Returns:
             False if the update was ignored as older than the cached entry.
@@ -141,7 +167,17 @@ class UserCache:
         if radio_id in self._cache:
             entry = self._cache[radio_id]
             if heard_at is not None and entry.last_heard > heard_at:
-                return False
+                if expires_at is None or not freqs_match(entry.freq, freq):
+                    return False
+                if entry.last_heard - heard_at <= SAME_REPORT_S:
+                    entry.expires_at = expires_at
+                else:
+                    entry.expires_at = max(self._expires(entry), expires_at)
+                LOGGER.debug(f'Cache: user {radio_id} routable until {entry.expires_at:.0f} (reported)')
+                return True
+            if expires_at is None and freqs_match(entry.freq, freq) and entry.expires_at is not None \
+                    and entry.expires_at > now + self._timeout:
+                expires_at = entry.expires_at       # heard again on the channel a report vouches for
             entry.repeater_id = repeater_id
             entry.outbound_name = outbound_name
             entry.callsign = callsign
@@ -153,6 +189,7 @@ class UserCache:
             entry.source = source
             entry.latitude, entry.longitude, entry.height = latitude, longitude, height
             entry.site = site
+            entry.expires_at = expires_at
             if talker_alias:
                 entry.talker_alias = talker_alias
             LOGGER.debug(f'Updated cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
@@ -173,6 +210,7 @@ class UserCache:
                 longitude=longitude,
                 height=height,
                 site=site,
+                expires_at=expires_at,
             )
             LOGGER.debug(f'Added to cache: user {radio_id} ({callsign}) on {source_desc} slot {slot} TG {talkgroup}')
         return True
@@ -208,7 +246,7 @@ class UserCache:
         entry = self._cache[radio_id]
         
         # Check if expired
-        if time() - entry.last_heard > self._timeout:
+        if self._expired(entry, time()):
             del self._cache[radio_id]
             LOGGER.debug(f'Removed expired entry for user {radio_id}')
             return None
@@ -265,7 +303,7 @@ class UserCache:
         expired = []
         
         for radio_id, entry in self._cache.items():
-            if now - entry.last_heard > self._timeout:
+            if self._expired(entry, now):
                 expired.append(radio_id)
         
         for radio_id in expired:
@@ -290,7 +328,7 @@ class UserCache:
         now = time()
         valid_entries = [
             entry for entry in self._cache.values()
-            if now - entry.last_heard <= self._timeout
+            if not self._expired(entry, now)
         ]
         
         # Sort by last heard (most recent first)
@@ -307,8 +345,7 @@ class UserCache:
             Dictionary with cache statistics
         """
         now = time()
-        valid = sum(1 for entry in self._cache.values() 
-                   if now - entry.last_heard <= self._timeout)
+        valid = sum(1 for entry in self._cache.values() if not self._expired(entry, now))
         
         return {
             'total_entries': len(self._cache),

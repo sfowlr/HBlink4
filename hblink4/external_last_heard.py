@@ -26,11 +26,18 @@ list of them:
      "source": "ars",              free text for logs/dashboard; optional
      "site": "north",              the receiver's site (pattern `site`); optional
      "latitude": 43.03,            where the receiver is (degrees); optional. Unit
-     "longitude": -77.72}          calls go out only at the radio's site: by `site`
+     "longitude": -77.72,          calls go out only at the radio's site: by `site`
                                    when both sides have one, else within
                                    global.site_radius_km of this. Neither: the
                                    place already known for the radio on this
                                    channel is kept
+     "expires": "2026-01-01T20:00:00Z"}  when it stops being a route (ISO 8601 or
+                                   Unix seconds); optional (default: `at` + the
+                                   user_cache timeout). For the channel the radio
+                                   is already cached on it applies even if the
+                                   cache heard it more recently (UserCache.update),
+                                   so a reporter that knows the radio (ARS) can keep
+                                   a route longer, or end it (a time in the past)
 
 Needs paho-mqtt (>=2.0), imported only when the feed is enabled. paho's
 network thread hands each message to the asyncio loop, so the user cache is
@@ -113,7 +120,8 @@ class ExternalLastHeard:
         if self._cache.update(radio_id=radio_id, repeater_id=0, callsign='', slot=slot, talkgroup=0,
                               freq=freq, colorcode=parse_colorcode(report.get('colorcode')),
                               source=f'{source}-ext', heard_at=at,
-                              latitude=lat, longitude=lon, height=height, site=site):
+                              latitude=lat, longitude=lon, height=height, site=site,
+                              expires_at=_epoch(report.get('expires'))):
             LOGGER.debug(f'External last-heard: {radio_id} on {freq} Hz TS{slot} [{source}]')
 
     def start(self, loop, cfg: Dict[str, Any]):

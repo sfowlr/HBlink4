@@ -191,3 +191,48 @@ def test_user_cache_clear():
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+F = 461687500
+
+
+def test_reported_expiry_outlives_the_timeout():
+    """An external report's expiry (RadioDesk: 8 h without ARS) keeps a route past the cache timeout."""
+    cache = UserCache(timeout_seconds=600)
+    now = time()
+    cache.update(3106000, 0, "", 2, 0, freq=F, source="voice-ext", heard_at=now - 3600, expires_at=now + 3600)
+    entry = cache.lookup(3106000)
+    assert entry is not None and entry.expires_at == now + 3600
+    assert cache.cleanup() == 0
+
+
+def test_a_report_extends_a_newer_local_entry_on_the_same_channel_only():
+    cache = UserCache(timeout_seconds=600)
+    now = time()
+    cache.update(3106000, 312345, "", 2, 3100, freq=F)                  # heard here just now
+    # RadioDesk's report of an hour-old hearing on this channel: older, so it can only extend.
+    assert cache.update(3106000, 0, "", 2, 0, freq=F, heard_at=now - 3600, expires_at=now + 7200)
+    assert cache.lookup(3106000).expires_at == now + 7200
+    assert cache.lookup(3106000).repeater_id == 312345                  # the newer entry is kept
+    assert cache.update(3106000, 0, "", 2, 0, freq=F, heard_at=now - 3600, expires_at=now - 1)
+    assert cache.lookup(3106000).expires_at == now + 7200               # older than 30 s: can't shorten
+    assert not cache.update(3106000, 0, "", 2, 0, freq=F + 25000, heard_at=now - 10, expires_at=now + 99999)
+
+
+def test_a_report_of_the_same_hearing_can_end_the_route():
+    """RadioDesk counts a radio gone (ARS: missed re-registrations): an expiry in the past ends its route."""
+    cache = UserCache(timeout_seconds=600)
+    now = time()
+    cache.update(3106000, 312345, "", 2, 3100, freq=F)
+    assert cache.update(3106000, 0, "", 2, 0, freq=F, heard_at=now - 5, expires_at=now - 1)
+    assert cache.lookup(3106000) is None
+
+
+def test_heard_again_keeps_the_reported_expiry():
+    cache = UserCache(timeout_seconds=600)
+    now = time()
+    cache.update(3106000, 0, "", 2, 0, freq=F, heard_at=now - 60, expires_at=now + 7200)
+    cache.update(3106000, 312345, "", 2, 3100, freq=F)                  # a local stream on that channel
+    assert cache.lookup(3106000).expires_at == now + 7200
+    cache.update(3106000, 312346, "", 2, 3100, freq=F + 25000)          # moved: the plain timeout again
+    assert cache.lookup(3106000).expires_at is None
