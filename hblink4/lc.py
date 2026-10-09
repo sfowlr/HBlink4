@@ -270,12 +270,54 @@ def sap_name(sap: int) -> str:
     return _SAP_NAMES.get(sap, f'SAP-{sap:#x}')
 
 
-def _decode_bptc_96(payload: bytes) -> Optional[bytes]:
-    """Decode a 33-byte DMR data-sync payload → 12 bytes (96 bits).
+# BPTC(196,96) with its Hamming row (15,11) and column (13,9) codes corrected (ETSI TS 102 361-1
+# Annex B.1.1; the same as RadioDesk's radiodesk.dmr.fec.bptc196_decode). Each code's parity checks:
+# the data bits each parity bit covers.
+_H15_11 = ((0, 1, 2, 3, 5, 7, 8), (1, 2, 3, 4, 6, 8, 9), (2, 3, 4, 5, 7, 9, 10), (0, 1, 2, 4, 6, 7, 10))
+_H13_9 = ((0, 1, 3, 5, 6), (0, 1, 2, 4, 6, 7), (0, 1, 2, 3, 5, 7, 8), (0, 2, 4, 5, 8))
+_BPTC_DATA_POS = (list(range(4, 12)) + list(range(16, 27)) + list(range(31, 42)) + list(range(46, 57))
+                  + list(range(61, 72)) + list(range(76, 87)) + list(range(91, 102))
+                  + list(range(106, 117)) + list(range(121, 132)))
 
-    Shares the BPTC(196,96) decode path with voice_head_term but returns
-    the full 96-bit payload instead of truncating to the 72-bit voice LC.
-    Returns None on decode failure.
+
+def _syndrome(word: list, k: int, checks) -> int:
+    s = 0
+    for i, eq in enumerate(checks):
+        p = word[k + i]
+        for j in eq:
+            p ^= word[j]
+        if p:
+            s |= 1 << i
+    return s
+
+
+def _syndrome_table(n: int, k: int, checks) -> dict:
+    """Single-bit error position by syndrome."""
+    table = {}
+    for pos in range(n):
+        w = [0] * n
+        w[pos] = 1
+        table[_syndrome(w, k, checks)] = pos
+    return table
+
+
+_FIX15 = _syndrome_table(15, 11, _H15_11)
+_FIX13 = _syndrome_table(13, 9, _H13_9)
+
+
+def _hamming_fix(word: list, k: int, checks, table: dict) -> bool:
+    """Correct one bit error in `word` in place; True if a bit was flipped."""
+    s = _syndrome(word, k, checks)
+    if s and s in table:
+        word[table[s]] ^= 1
+        return True
+    return False
+
+
+def _decode_bptc_96(payload: bytes) -> Optional[bytes]:
+    """Decode a 33-byte DMR data-sync payload → 12 bytes (96 bits), with
+    single-bit errors per row and column corrected (iterated, as the codes
+    are a product code). None if errors remain in a row after that.
 
     The 12 bytes are laid out per the transport that rides in this frame:
     for a Data Header, bytes 0-9 are the header and bytes 10-11 are the
@@ -284,22 +326,29 @@ def _decode_bptc_96(payload: bytes) -> Optional[bytes]:
     """
     if len(payload) < 33:
         return None
-    try:
-        bits = bitarray(endian='big')
-        bits.frombytes(payload)
-        info = bits[0:98] + bits[166:264]
-        head_72 = bptc.decode_full_lc(info)
-    except Exception:
+    bits = bitarray(endian='big')
+    bits.frombytes(payload[:33])
+    raw = (bits[0:98] + bits[166:264]).tolist()
+    d = [raw[(a * 181) % 196] for a in range(196)]
+    for _ in range(5):
+        fixing = False
+        for c in range(15):
+            col = [d[c + 1 + 15 * r] for r in range(13)]
+            if _hamming_fix(col, 9, _H13_9, _FIX13):
+                for r in range(13):
+                    d[c + 1 + 15 * r] = col[r]
+                fixing = True
+        for r in range(9):
+            row = d[r * 15 + 1: r * 15 + 16]
+            if _hamming_fix(row, 11, _H15_11, _FIX15):
+                d[r * 15 + 1: r * 15 + 16] = row
+                fixing = True
+        if not fixing:
+            break
+    if any(_syndrome(d[r * 15 + 1: r * 15 + 16], 11, _H15_11) for r in range(9)):
         return None
-    if head_72 is None or len(head_72) < 72:
-        return None
-    tail = bitarray(endian='big')
-    for pos in _DATA_HEADER_TAIL_POSITIONS:
-        if pos >= len(info):
-            return None
-        tail.append(info[pos])
-    full = head_72 + tail
-    return full.tobytes()
+    out = bitarray([d[p] for p in _BPTC_DATA_POS], endian='big')
+    return out.tobytes()
 
 
 def decode_bptc_block(payload: bytes) -> Optional[bytes]:

@@ -180,3 +180,48 @@ def test_an_unroutable_check_fails_at_once_even_with_retries_on():
             clock.t += 1
             hb._check_unit_data()
     assert all(not r.sent for r in hb._repeaters.values())
+
+
+def test_a_csbk_with_a_bit_error_is_still_a_single_csbk():
+    """On air (2026-10-08) a radio's answer came in with an error the old decoder didn't correct (its last
+    24 bits, the CRC among them, were read raw), so it was taken for data and held for retry."""
+    from hblink4.lc import is_single_csbk
+    clean = bptc_payload(radio_check12(RADIO, GATEWAY_ID, answer=True))
+    info = [i for i in range(264) if i < 98 or i >= 166]          # the 196 BPTC bits, not the sync / slot type
+    for bit in info:
+        hit = bytearray(clean)
+        hit[bit // 8] ^= 0x80 >> (bit % 8)
+        assert is_single_csbk(bytes(hit)), bit
+
+
+def test_a_report_from_outside_of_our_own_check_heard_is_ignored():
+    """On air (2026-10-08): RadioDesk's receivers heard the roamer send a test peer's check and reported
+    that source ID back over external_last_heard, which put it on the roamer's channel."""
+    import json
+    from datetime import datetime, timezone
+    from hblink4.external_last_heard import ExternalLastHeard
+    from test_roaming import CHANNELS, ROAM1, SIMPLEX, dmrk, heard_at, roamer
+    from test_unit_call_routing import peer
+    TESTER, TESTER_ID = 3129200, 9990201
+    hb, clock = gateway_hb(), Clock()
+    hb._external_last_heard = FakeMqtt()
+    roamer(hb, ROAM1)
+    peer(hb, TESTER)
+    heard_at(hb, SIMPLEX)
+    feed_ext = ExternalLastHeard(hb._user_cache, is_echo=hb._sent_as_echo)
+
+    def report(radio, t):
+        at = datetime.fromtimestamp(t, timezone.utc).isoformat().replace('+00:00', 'Z')
+        feed_ext.handle('hblink4/last_heard', json.dumps({'radio_id': radio, 'freq': SIMPLEX, 'at': at}).encode())
+
+    with patch.dict(hblink.CONFIG, {'global': {**BASE, **CHANNELS['global']}}), patch.object(hblink, 'time', clock):
+        feed(hb, TESTER, [dmrd(TESTER_ID, RADIO, TESTER, 1, 3, REQ, bptc_payload(radio_check12(TESTER_ID, RADIO)))])
+        hb._handle_roaming_ack(rid(ROAM1), dmrk(REQ.to_bytes(4, 'big'), 0))
+        heard_then = clock.t + 0.3
+        clock.t += 4                                                  # the report comes a few seconds later
+        report(TESTER_ID, heard_then)
+        assert hb._user_cache.lookup(TESTER_ID).repeater_id == TESTER
+        assert not hb._sent_as_echo(1234567, SIMPLEX, heard_then)    # another radio there would be taken
+        ack = dmrd(RADIO, TESTER_ID, ROAM1, 2, 3, ACK, bptc_payload(radio_check12(RADIO, TESTER_ID, answer=True)))
+        feed(hb, ROAM1, [ack])
+    assert [p[20:53] for p in hb._repeaters[rid(TESTER)].sent] == [ack[20:53]]

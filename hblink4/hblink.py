@@ -41,6 +41,10 @@ ROAMING_COOLDOWN = 30.0       # a roamer that failed (radio error, no answer) is
 ROAMING_REPLAY_MAX = 200      # packets kept per call until its DMRK, to replay to the next roamer
 
 
+SENT_AS_KEEP_S = 60.0       # how long what we sent as a source is remembered (_sent_as)
+SENT_AS_SLACK_S = 3.0       # clock and burst-timing slack around it
+
+
 class RoamingCall:
     """A unit call sent to a roaming transceiver, until it answers DMRK on air:
     what's needed to hand it to another roamer if this one can't."""
@@ -153,6 +157,9 @@ class HBProtocol(asyncio.DatagramProtocol):
         self._repeaters: Dict[bytes, RepeaterState] = {}
         # (stream id, roamer) → call awaiting its DMRK. A group call can have one per site.
         self._roaming_calls: Dict[Tuple[bytes, bytes], RoamingCall] = {}
+        # What we've transmitted as each source ID lately: radio → [[stream id, peer, freq, first, last]]
+        # (SENT_AS_KEEP_S), so a report of that radio heard on that frequency then is known for our own echo.
+        self._sent_as: Dict[int, List[list]] = {}
         self._roaming_turn = 0                                # counts calls given to roamers
         
         # Outbound connection state management (Phase 2)
@@ -1293,7 +1300,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         ext_cfg = CONFIG.get('global', {}).get('external_last_heard')
         if ext_cfg and self._external_last_heard is None:
             try:
-                feed = ExternalLastHeard(self._user_cache, ext_cfg.get('topic', 'hblink4/last_heard'))
+                feed = ExternalLastHeard(self._user_cache, ext_cfg.get('topic', 'hblink4/last_heard'),
+                                         is_echo=self._sent_as_echo)
                 self._external_last_heard = feed.start(asyncio.get_running_loop(), ext_cfg)
             except Exception as e:
                 LOGGER.error(f'External last-heard feed not started: {e}')
@@ -2622,6 +2630,35 @@ class HBProtocol(asyncio.DatagramProtocol):
                         and self._at_site(r, place)):
                     return r.repeater_id
         return None
+
+    def _note_sent_as(self, repeater: RepeaterState, rf_src: bytes, stream_id: bytes, now: float) -> None:
+        """Remember that `repeater` is transmitting as `rf_src` now, and on what frequency (a roamer's is
+        its call's channel: it may still report the last one)."""
+        call = self._roaming_calls.get((stream_id, repeater.repeater_id))
+        freq = call.channel['freq'] if call is not None else parse_freq_hz(repeater.tx_freq)
+        if not freq:
+            return
+        radio = bytes_to_int(rf_src)
+        entries = [e for e in self._sent_as.get(radio, []) if now - e[4] < SENT_AS_KEEP_S]
+        for e in entries:
+            if e[0] == stream_id and e[1] == repeater.repeater_id:
+                e[4] = now
+                break
+        else:
+            entries.append([stream_id, repeater.repeater_id, freq, now, now])
+        self._sent_as[radio] = entries
+
+    def _sent_as_echo(self, radio_id: int, freq: int, at: float) -> bool:
+        """Was `radio_id` heard on `freq` at `at` only because we were sending as it there then? For
+        reports from outside (external_last_heard: a receiver that isn't a peer hearing our roamer)."""
+        now = time()
+        entries = [e for e in self._sent_as.get(radio_id, []) if now - e[4] < SENT_AS_KEEP_S]
+        if not entries:
+            self._sent_as.pop(radio_id, None)
+            return False
+        self._sent_as[radio_id] = entries
+        return any(freqs_match(freq, e[2]) and e[3] - SENT_AS_SLACK_S <= at <= e[4] + SENT_AS_SLACK_S
+                   for e in entries)
 
     def _our_rf_echo(self, heard_by: RepeaterState, rf_src: bytes, dst_id: bytes) -> Optional[bytes]:
         """`_our_echo`, for unit calls and unit data: only a peer listening where we're sending can hear
@@ -4982,6 +5019,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         """
         current_stream = repeater.get_slot_stream(slot)
         current_time = time()
+        self._note_sent_as(repeater, rf_src, stream_id, current_time)
 
         if not current_stream or current_stream.stream_id != stream_id:
             # New assumed stream starting

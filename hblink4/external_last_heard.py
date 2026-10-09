@@ -66,9 +66,12 @@ def _epoch(value: Any) -> Optional[float]:
 
 
 class ExternalLastHeard:
-    def __init__(self, user_cache, topic: str = DEFAULT_TOPIC) -> None:
+    def __init__(self, user_cache, topic: str = DEFAULT_TOPIC, is_echo=None) -> None:
+        """*is_echo(radio_id, freq, at)*: True when that report is only our own transmission heard
+        (HBProtocol._sent_as_echo): such reports are ignored."""
         self._cache = user_cache
         self.topic = topic.rstrip('/')
+        self._is_echo = is_echo
 
     @property
     def subscriptions(self):
@@ -94,6 +97,9 @@ class ExternalLastHeard:
             return
         slot = report.get('slot') if report.get('slot') in (1, 2) else 0
         at = _epoch(report.get('at')) or time()
+        if self._is_echo is not None and self._is_echo(radio_id, freq, at):
+            LOGGER.debug(f'External last-heard: {radio_id} on {freq} Hz is our own transmission, ignored')
+            return
         source = str(report.get('source') or 'external')[:16]
         lat, lon, height = parse_location(report.get('latitude'), report.get('longitude'), report.get('height'))
         site = str(report['site'])[:32] if report.get('site') else None
