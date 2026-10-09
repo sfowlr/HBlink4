@@ -93,8 +93,15 @@ class RepeaterConfig:
     # another — "all" (any channel in roaming_channels), "idle" (only its idle
     # channel, which its DMRC reports) or "none"; None = global.roaming_group_calls.
     roaming_group_calls: Optional[str] = None
+    # A single frequency repeater: it hears radios on one slot and repeats them
+    # on the other, the same frequency. Everything sent to it goes out on this
+    # slot (its outbound one), and the slot is busy while it's repeating. None:
+    # an ordinary peer.
+    sfr_slot: Optional[int] = None
 
     def __post_init__(self):
+        if self.sfr_slot not in (None, 1, 2):
+            raise ValueError(f"sfr_slot must be 1 or 2, not {self.sfr_slot!r}")
         if self.roaming_interrupt_rx not in (None,) + ROAMING_INTERRUPT_MODES:
             raise ValueError(f"roaming_interrupt_rx must be one of {ROAMING_INTERRUPT_MODES}, "
                              f"not {self.roaming_interrupt_rx!r}")

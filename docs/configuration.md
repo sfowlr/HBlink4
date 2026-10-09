@@ -642,6 +642,7 @@ Multiple match types in a single pattern are combined with OR logic (any match t
 | `roaming_interrupt_rx` | string | Roamers: `"never"`, `"last_resort"` or `"as_needed"` — may it drop a call it's hearing to transmit elsewhere (default: `global.roaming_interrupt_rx`). E.g. `"never"` for the one that is the only receiver on its channel |
 | `roaming_group_calls` | string | Roamers: `"all"`, `"idle"` or `"none"` — may it carry group calls heard at other sites (default: `global.roaming_group_calls`, itself `"none"`). `"idle"`: only calls on its idle channel, which it reports in its DMRC (protocol.md) |
 | `site` | string | Where the peer is, for networks spread over several places on one channel plan (see "Sites" above). Without it, the peer's location and `global.site_radius_km` decide |
+| `sfr_slot` | integer | A single frequency repeater: one frequency, radios heard on one slot and repeated by the repeater itself on the other. This is that other slot (its outbound one, 1 or 2): everything sent to the peer goes out on it, unit calls to radios heard on its inbound slot included, and it's busy while the repeater is repeating a call. A receiver on its frequency hearing the repeat on this slot is hearing an echo: not routed, and the radio stays placed on the inbound slot. Talkgroup lists stay network-side, as for any peer (default: none, an ordinary peer) |
 
 **Symmetric Routing:**
 The same talkgroup lists control BOTH directions:

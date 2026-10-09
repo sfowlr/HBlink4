@@ -310,6 +310,10 @@ class RepeaterState:
     roaming_cooldown_until: float = 0.0          # skipped until then (radio error / no answer)
 
     roaming_group_calls: Optional[str] = None    # None: global.roaming_group_calls
+
+    # A single frequency repeater (pattern `sfr_slot`): what it hears on its
+    # other slot goes out on this one, on the same frequency. None: not one.
+    sfr_slot: Optional[int] = None
     roaming_idle: Optional[Tuple[int, Optional[int]]] = None   # (Hz, color code) from its DMRC
 
     # The matched pattern's `site` (see RepeaterConfig.site), or None.

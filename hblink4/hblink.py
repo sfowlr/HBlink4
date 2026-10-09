@@ -360,6 +360,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         repeater.roaming_interrupt_rx = repeater_config.roaming_interrupt_rx
         repeater.site = repeater_config.site
         repeater.roaming_group_calls = repeater_config.roaming_group_calls
+        repeater.sfr_slot = repeater_config.sfr_slot
         LOGGER.debug(
             f'Repeater {rid_to_int(repeater_id)} unit calls '
             f'{"ENABLED" if repeater.unit_calls_enabled else "DISABLED"} (pattern default)'
@@ -980,6 +981,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                     out_slot, out_dst = _slot, _dst_id
             else:
                 out_slot, out_dst = _slot, _dst_id
+            out_slot = self._tx_slot(local_repeater, out_slot)
 
             # Check slot availability (don't hijack active streams) on target-local slot
             if self._is_slot_busy(local_repeater_id, out_slot, _stream_id, _rf_src, out_dst):
@@ -1168,7 +1170,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 continue
             # No translation for unit calls — just forward the packet, on the
             # target radio's slot.
-            out_slot = (source_stream.target_slots or {}).get(target_repeater_id, _slot)
+            out_slot = self._tx_slot(target_repeater,
+                                     (source_stream.target_slots or {}).get(target_repeater_id, _slot))
             if out_slot == _slot:
                 packet = data
             else:
@@ -1857,8 +1860,17 @@ class HBProtocol(asyncio.DatagramProtocol):
         if not repeater:
             return False
 
-        # Get the slot's current stream
-        current_stream = repeater.get_slot_stream(slot)
+        # A single frequency repeater repeats what it hears on its other slot
+        # out on this one: that call has this slot too.
+        if repeater.sfr_slot and slot == repeater.sfr_slot:
+            if self._stream_blocks(repeater.get_slot_stream(3 - slot), stream_id, rf_src, dst_id,
+                                   is_unit_call):
+                return True
+        return self._stream_blocks(repeater.get_slot_stream(slot), stream_id, rf_src, dst_id, is_unit_call)
+
+    def _stream_blocks(self, current_stream: Optional[StreamState], stream_id: bytes,
+                       rf_src: Optional[bytes], dst_id: Optional[bytes], is_unit_call: bool) -> bool:
+        """_is_slot_busy for one slot's stream."""
         if not current_stream:
             return False  # No stream, slot is free
 
@@ -2089,7 +2101,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         target_slots: Dict[Any, int] = {}
         # Our own transmission (a roamer or peer sending this src → dst at the site), heard back by
         # another peer there: not the radio, so neither routed nor a place to find the source.
-        echo = (self._our_rf_echo(source_repeater, rf_src, dst_id)
+        echo = (self._our_rf_echo(source_repeater, rf_src, dst_id, slot)
                 if source_repeater is not None and not is_group else None)
         # From a peer that can't source unit calls (a receive-only SDR), unit data still goes to a pinned
         # ID (a bot or gateway that owns it): a radio's answer to it may be heard only there.
@@ -2367,7 +2379,7 @@ class HBProtocol(asyncio.DatagramProtocol):
         # outbound_map lookup speaks the same vocabulary. Our own transmission,
         # heard back by a receiver at the site we're sending it at, goes nowhere.
         heard_on = self._peer_channel(rid_to_int(repeater.repeater_id))
-        echo = self._our_echo(repeater, rf_src, net_dst_id)
+        echo = self._our_echo(repeater, rf_src, net_dst_id, slot)
         if echo is None and self._vote_join(repeater, slot, rf_src, dst_id, net_dst_id, stream_id, False):
             return True
         if echo is not None:
@@ -2468,7 +2480,7 @@ class HBProtocol(asyncio.DatagramProtocol):
 
         # Our own unit call, heard back by another peer at the site we're sending it at: not the
         # radio. Not routed (it would go out again), and not where the source is.
-        echo = self._our_rf_echo(repeater, rf_src, dst_id)
+        echo = self._our_rf_echo(repeater, rf_src, dst_id, slot)
         if echo is not None:
             self._log_unit_rejection(stream_id, logging.INFO,
                 f'UNIT CALL echo on repeater {rid_int} TS{slot}: src={src_int} → dst={dst_int} '
@@ -2640,14 +2652,20 @@ class HBProtocol(asyncio.DatagramProtocol):
             return ''
         return f' heard at {ch["freq"] / 1e6:.5f} MHz' + (f' CC{ch["colorcode"]}' if ch['colorcode'] is not None else '')
 
-    def _our_echo(self, heard_by: RepeaterState, rf_src: bytes, dst_id: bytes) -> Optional[bytes]:
+    def _our_echo(self, heard_by: RepeaterState, rf_src: bytes, dst_id: bytes,
+                  slot: Optional[int] = None) -> Optional[bytes]:
         """The peer we're sending `rf_src` → `dst_id` out of (or did, within
         `stream_hang_time`), at `heard_by`'s site — and, for a fixed peer, on
         the frequency `heard_by` receives on when it has one (then a peer
         without a frequency, on the network, can't be it; a roamer only ever
         carries a call away from the talker's site, so any one at the site
         is it) — so `heard_by` is hearing our own transmission, not the
-        radio — or None."""
+        radio — or None.
+
+        With `slot` (where `heard_by` hears it): also a single frequency
+        repeater on that frequency repeating the call on `slot`, its outbound
+        one, having heard it on the other. `heard_by` hears the repeat; the
+        radio's own transmission is the repeater's stream."""
         now = time()
         hang = CONFIG.get('global', {}).get('stream_hang_time', 10.0)
         place = self._place(heard_by)
@@ -2664,6 +2682,11 @@ class HBProtocol(asyncio.DatagramProtocol):
                 if (st is not None and st.is_assumed and st.rf_src == rf_src and st.dst_id == dst_id
                         and (not st.ended or (st.end_time and now - st.end_time < hang))
                         and self._at_site(r, place)):
+                    return r.repeater_id
+            if rx and r.sfr_slot and slot == r.sfr_slot:
+                st = r.get_slot_stream(3 - slot)
+                if (st is not None and not st.is_assumed and st.rf_src == rf_src and st.dst_id == dst_id
+                        and (not st.ended or (st.end_time and now - st.end_time < hang))):
                     return r.repeater_id
         return None
 
@@ -2713,11 +2736,12 @@ class HBProtocol(asyncio.DatagramProtocol):
         return any(freqs_match(freq, e[2]) and e[3] - SENT_AS_SLACK_S <= at <= e[4] + SENT_AS_SLACK_S
                    for e in entries)
 
-    def _our_rf_echo(self, heard_by: RepeaterState, rf_src: bytes, dst_id: bytes) -> Optional[bytes]:
+    def _our_rf_echo(self, heard_by: RepeaterState, rf_src: bytes, dst_id: bytes,
+                     slot: Optional[int] = None) -> Optional[bytes]:
         """`_our_echo`, for unit calls and unit data: only a peer listening where we're sending can hear
         it, so `heard_by` must receive on the frequency that peer sends on. A network peer (a bot, a
         gateway: no frequency) sending the same src → dst again is a new call, not an echo."""
-        echo = self._our_echo(heard_by, rf_src, dst_id)
+        echo = self._our_echo(heard_by, rf_src, dst_id, slot)
         if echo is None:
             return None
         rx = parse_freq_hz(heard_by.rx_freq)
@@ -3005,7 +3029,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             repeater = self._repeaters.get(target)
             if repeater is None:
                 continue
-            out_slot = (target_slots or {}).get(target, rec.slot)
+            out_slot = self._tx_slot(repeater, (target_slots or {}).get(target, rec.slot))
             out = bytearray(buf)
             out[15] = (out[15] | 0x80) if out_slot == 2 else (out[15] & 0x7F)
             repeater.send(bytes(out))
@@ -3035,6 +3059,12 @@ class HBProtocol(asyncio.DatagramProtocol):
         """Record on a received stream the channel it was heard on (see StreamState.freq)."""
         stream.freq, stream.colorcode = channel['freq'], channel['colorcode']
 
+    @staticmethod
+    def _tx_slot(repeater: RepeaterState, slot: int) -> int:
+        """The slot a call for `repeater` on `slot` goes out on: a single frequency
+        repeater's outbound slot (`sfr_slot`), whatever the call's."""
+        return repeater.sfr_slot or slot
+
     def _unit_target_ok(self, repeater: RepeaterState, slot: int, stream_id: bytes,
                         rf_src: bytes, dst_id: bytes) -> bool:
         return (repeater.connection_state == 'connected'
@@ -3053,7 +3083,8 @@ class HBProtocol(asyncio.DatagramProtocol):
         The target is where the user cache last placed the radio (heard here,
         or reported over `external_last_heard`, e.g. from receivers that
         aren't peers or from ARS registrations):
-          1. that peer, if it can transmit, on the radio's last slot;
+          1. that peer, if it can transmit, on the radio's last slot (a
+             single frequency repeater's: its outbound slot, `sfr_slot`);
           2. else a TX-capable peer on the same channel — its RX or TX
              frequency equal to the one the radio was heard on (and the same
              color code, when both are known) — on the radio's last slot.
@@ -3102,8 +3133,9 @@ class HBProtocol(asyncio.DatagramProtocol):
         for repeater in candidates:
             if repeater.repeater_id == source_repeater_id:
                 continue
-            if self._unit_target_ok(repeater, out_slot, stream_id, rf_src, dst_id):
-                return (repeater.repeater_id, out_slot)
+            tx_slot = self._tx_slot(repeater, out_slot)
+            if self._unit_target_ok(repeater, tx_slot, stream_id, rf_src, dst_id):
+                return (repeater.repeater_id, tx_slot)
             busy = busy or (repeater.connection_state == 'connected' and repeater.unit_calls_enabled
                             and repeater.tx_capable)         # it could send, but its slot is taken
         if candidates or entry.freq is None:
@@ -4625,6 +4657,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                     check_slot, check_dst = slot, dst_id
             else:
                 check_slot, check_dst = slot, dst_id
+            check_slot = self._tx_slot(target_repeater, check_slot)
 
             # Check slot availability AT STREAM START (not per-packet!)
             # If busy now, exclude from this transmission entirely
@@ -5028,6 +5061,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                         out_slot, out_dst = base_slot, net_dst_id
                 else:
                     out_slot, out_dst = base_slot, net_dst_id
+                out_slot = self._tx_slot(target_repeater, out_slot)
 
                 # Fast path: no source translation, no target translation, no
                 # LC rewrite needed — ship the original buffer as-is.
