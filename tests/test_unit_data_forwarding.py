@@ -109,8 +109,23 @@ def test_unroutable_unit_data_emits_event_and_sends_nothing():
     assert all(not r.sent for r in hb._repeaters.values())
 
 
-def test_receive_only_peer_does_not_forward_unit_data():
+def test_receive_only_peer_forwards_unit_data_only_to_a_pinned_id():
+    """A radio's reply to a gateway (a TMS ACK right after its data-level ACK) may be heard only by an SDR
+    (on air, 2026-10-09): it goes to the pinned gateway. Unit data between radios it hears still doesn't."""
     hb = gateway_hb()
     with patch.dict(hblink.CONFIG, FORWARD):
-        feed(hb, SDR1, transaction(RADIO, GATEWAY_ID, SDR1, 1))
-    assert hb._repeaters[rid(GATEWAY_PEER)].sent == []
+        packets = transaction(RADIO, GATEWAY_ID, SDR1, 1)
+        feed(hb, SDR1, packets)
+        assert len(hb._repeaters[rid(GATEWAY_PEER)].sent) == len(packets)       # preambles repeat: all go
+        feed(hb, SDR1, transaction(RADIO, 3100999, SDR1, 1, first_stream=0x400))
+    assert all(not r.sent for r in hb._repeaters.values() if r.repeater_id != rid(GATEWAY_PEER))
+    assert len(hb._repeaters[rid(GATEWAY_PEER)].sent) == len(packets)
+
+
+def test_the_same_unit_data_heard_by_two_peers_goes_once():
+    hb = gateway_hb()
+    with patch.dict(hblink.CONFIG, FORWARD):
+        feed(hb, MODEM1, transaction(RADIO, GATEWAY_ID, MODEM1, 2))
+        n = len(hb._repeaters[rid(GATEWAY_PEER)].sent)
+        feed(hb, SDR1, transaction(RADIO, GATEWAY_ID, SDR1, 2, first_stream=0x500))   # the SDR hears it too
+    assert n > 0 and len(hb._repeaters[rid(GATEWAY_PEER)].sent) == n

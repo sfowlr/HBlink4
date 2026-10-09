@@ -185,6 +185,9 @@ class UserCache:
                                            slot=0, talkgroup=0, source='static')
         LOGGER.info(f'Pinned user {radio_id} to repeater {repeater_id}')
     
+    def is_pinned(self, radio_id: int) -> bool:
+        return radio_id in self._static
+
     def lookup(self, radio_id: int) -> Optional[UserEntry]:
         """
         Look up a user in the cache.

@@ -41,6 +41,7 @@ ROAMING_COOLDOWN = 30.0       # a roamer that failed (radio error, no answer) is
 ROAMING_REPLAY_MAX = 200      # packets kept per call until its DMRK, to replay to the next roamer
 
 
+UNIT_DATA_DUP_S = 1.0       # the same unit data burst from a second peer within this is a duplicate
 SENT_AS_KEEP_S = 60.0       # how long what we sent as a source is remembered (_sent_as)
 SENT_AS_SLACK_S = 3.0       # clock and burst-timing slack around it
 
@@ -160,6 +161,9 @@ class HBProtocol(asyncio.DatagramProtocol):
         # What we've transmitted as each source ID lately: radio → [[stream id, peer, freq, first, last]]
         # (SENT_AS_KEEP_S), so a report of that radio heard on that frequency then is known for our own echo.
         self._sent_as: Dict[int, List[list]] = {}
+        # Unit data bursts that started a stream lately, by (src, dst, decoded content): the same burst heard
+        # by a second peer (an SDR and a roamer on one channel) isn't forwarded twice (UNIT_DATA_DUP_S).
+        self._unit_data_seen: Dict[Tuple[int, int, bytes], Tuple[float, bytes]] = {}
         self._roaming_turn = 0                                # counts calls given to roamers
         
         # Outbound connection state management (Phase 2)
@@ -2079,9 +2083,15 @@ class HBProtocol(asyncio.DatagramProtocol):
         # another peer there: not the radio, so neither routed nor a place to find the source.
         echo = (self._our_rf_echo(source_repeater, rf_src, dst_id)
                 if source_repeater is not None and not is_group else None)
+        # From a peer that can't source unit calls (a receive-only SDR), unit data still goes to a pinned
+        # ID (a bot or gateway that owns it): a radio's answer to it may be heard only there.
+        to_pinned = (self._user_cache is not None and hasattr(self._user_cache, 'is_pinned')
+                     and self._user_cache.is_pinned(dst_int))
         routed = (echo is None and not is_group and source_repeater is not None
-                  and source_repeater.unit_calls_enabled
-                  and CONFIG.get('global', {}).get('forward_unit_data', False))
+                  and (source_repeater.unit_calls_enabled or to_pinned)
+                  and CONFIG.get('global', {}).get('forward_unit_data', False)
+                  and not self._unit_data_duplicate(source_repeater.repeater_id, src_int, dst_int, frame_type,
+                                                    payload, current_time))
         is_broadcast = False
         if routed:
             targets, is_broadcast, target_slots = self._calculate_unit_call_targets(
@@ -2630,6 +2640,23 @@ class HBProtocol(asyncio.DatagramProtocol):
                         and self._at_site(r, place)):
                     return r.repeater_id
         return None
+
+    def _unit_data_duplicate(self, peer: bytes, src: int, dst: int, frame_type: int, payload: bytes,
+                             now: float) -> bool:
+        """The same unit data burst (src, dst, decoded content) already started a stream within
+        UNIT_DATA_DUP_S from *another* peer (an SDR and a roamer hearing one transmission): True, don't
+        forward it again. The same peer repeating a burst (preamble CSBKs, each its own stream) isn't one."""
+        block = decode_bptc_block(payload) if frame_type == 2 else None
+        if block is None:
+            return False
+        for k in [k for k, (t, _) in self._unit_data_seen.items() if now - t > UNIT_DATA_DUP_S]:
+            del self._unit_data_seen[k]
+        key = (src, dst, block)
+        seen = self._unit_data_seen.get(key)
+        if seen is not None and seen[1] != peer:
+            return True
+        self._unit_data_seen[key] = (now, peer)
+        return False
 
     def _note_sent_as(self, repeater: RepeaterState, rf_src: bytes, stream_id: bytes, now: float) -> None:
         """Remember that `repeater` is transmitting as `rf_src` now, and on what frequency (a roamer's is
