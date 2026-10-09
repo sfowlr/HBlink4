@@ -139,3 +139,44 @@ def test_radio_check_through_a_roaming_transceiver_and_back():
         ack = dmrd(RADIO, GATEWAY_ID, ROAM1, 2, 3, ACK, bptc_payload(radio_check12(RADIO, GATEWAY_ID, answer=True)))
         feed(hb, ROAM1, [ack])
     assert [p[20:53] for p in hb._repeaters[rid(GATEWAY_PEER)].sent] == [ack[20:53]]
+
+
+def test_our_check_heard_back_by_a_receiver_does_not_move_the_sender():
+    """On air (2026-10-08): a receiver at the site heard the roamer send a test peer's radio check and
+    HBlink4 took that for where the test peer was, so the radio's answer went back out on the air."""
+    from test_roaming import CHANNELS, ROAM1, SIMPLEX, dmrk, heard_at, roamer
+    from test_unit_call_routing import peer
+    TESTER, TESTER_ID, SDR = 3129200, 9990201, 3129300
+    hb, clock = gateway_hb(), Clock()
+    hb._external_last_heard = FakeMqtt()
+    roamer(hb, ROAM1)
+    peer(hb, TESTER)
+    sdr = peer(hb, SDR, tx=False, unit=False)
+    sdr.rx_freq = sdr.tx_freq = str(SIMPLEX).encode()
+    heard_at(hb, SIMPLEX)
+    with patch.dict(hblink.CONFIG, {'global': {**BASE, **CHANNELS['global']}}), patch.object(hblink, 'time', clock):
+        feed(hb, TESTER, [dmrd(TESTER_ID, RADIO, TESTER, 1, 3, REQ, bptc_payload(radio_check12(TESTER_ID, RADIO)))])
+        hb._handle_roaming_ack(rid(ROAM1), dmrk(REQ.to_bytes(4, 'big'), 0))         # on air on SIMPLEX
+        clock.t += 0.3
+        feed(hb, SDR, [dmrd(TESTER_ID, RADIO, SDR, 2, 3, 0x777,                         # the receiver hears it
+                            bptc_payload(radio_check12(TESTER_ID, RADIO)))])
+        assert hb._user_cache.lookup(TESTER_ID).repeater_id == TESTER
+        clock.t += 0.2
+        ack = dmrd(RADIO, TESTER_ID, ROAM1, 2, 3, ACK, bptc_payload(radio_check12(RADIO, TESTER_ID, answer=True)))
+        feed(hb, ROAM1, [ack])
+    assert [p[20:53] for p in hb._repeaters[rid(TESTER)].sent] == [ack[20:53]]
+
+
+def test_an_unroutable_check_fails_at_once_even_with_retries_on():
+    """The chatbot asks again itself; held for HBlink4's retry, its 'not sent' would come too late."""
+    hb, clock = gateway_hb(), Clock()
+    hb._external_last_heard = FakeMqtt()
+    with patch.dict(hblink.CONFIG, {'global': RETRY}), patch.object(hblink, 'time', clock):
+        feed(hb, GATEWAY_PEER, [dmrd(GATEWAY_ID, RADIO, GATEWAY_PEER, 1, 3, REQ,
+                                     bptc_payload(radio_check12(GATEWAY_ID, RADIO)))])
+        assert statuses(hb, REQ) == [('failed', 'no route')]
+        heard(hb, RADIO, MODEM1, 2)
+        for _ in range(10):
+            clock.t += 1
+            hb._check_unit_data()
+    assert all(not r.sent for r in hb._repeaters.values())

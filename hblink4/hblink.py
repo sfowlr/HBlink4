@@ -2067,7 +2067,11 @@ class HBProtocol(asyncio.DatagramProtocol):
 
         targets: set = set()
         target_slots: Dict[Any, int] = {}
-        routed = (not is_group and source_repeater is not None
+        # Our own transmission (a roamer or peer sending this src → dst at the site), heard back by
+        # another peer there: not the radio, so neither routed nor a place to find the source.
+        echo = (self._our_rf_echo(source_repeater, rf_src, dst_id)
+                if source_repeater is not None and not is_group else None)
+        routed = (echo is None and not is_group and source_repeater is not None
                   and source_repeater.unit_calls_enabled
                   and CONFIG.get('global', {}).get('forward_unit_data', False))
         is_broadcast = False
@@ -2096,7 +2100,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                 parts.append(f'raw={decoded["raw"].hex()}')
             else:
                 parts.append(f'payload={payload[:16].hex()}')
-            if not routed:
+            if echo is not None:
+                parts.append(f'[our own transmission, sent via {rid_to_int(echo)}]')
+            elif not routed:
                 parts.append('[not forwarded]')
             elif targets:
                 target = next(iter(targets))
@@ -2124,14 +2130,15 @@ class HBProtocol(asyncio.DatagramProtocol):
         )
         heard_on = self._peer_channel(cache_repeater_id)
         self._stamp_channel(new_stream, heard_on)
-        if not is_group and source_repeater is not None:
-            self._unit_data_start(new_stream, decoded, routed, targets, is_broadcast, src_int, dst_int)
+        if not is_group and source_repeater is not None and echo is None:
+            single = frame_type == 2 and dtype_vseq == 3 and is_single_csbk(payload)
+            self._unit_data_start(new_stream, decoded, routed, targets, is_broadcast, src_int, dst_int, single)
 
         # Populate the user cache — data calls are as good a locator as
         # voice. If a radio beacons APRS from repeater X now, a unit voice
         # call placed to that radio ten minutes later routes to X instead
-        # of broadcasting.
-        if self._user_cache:
+        # of broadcasting. Not from an echo of our own transmission.
+        if self._user_cache and echo is None:
             self._user_cache.update(
                 radio_id=src_int,
                 repeater_id=cache_repeater_id,
@@ -2429,6 +2436,15 @@ class HBProtocol(asyncio.DatagramProtocol):
         src_int = bytes_to_int(rf_src)
         dst_int = bytes_to_int(dst_id)
 
+        # Our own unit call, heard back by another peer at the site we're sending it at: not the
+        # radio. Not routed (it would go out again), and not where the source is.
+        echo = self._our_rf_echo(repeater, rf_src, dst_id)
+        if echo is not None:
+            self._log_unit_rejection(stream_id, logging.INFO,
+                f'UNIT CALL echo on repeater {rid_int} TS{slot}: src={src_int} → dst={dst_int} '
+                f'stream_id={stream_id.hex()} [our own call, being sent via {rid_to_int(echo)}]')
+            return False
+
         # Gate at the source: repeater must be enabled for unit calls.
         if not repeater.unit_calls_enabled:
             self._log_unit_rejection(stream_id, logging.INFO,
@@ -2607,6 +2623,18 @@ class HBProtocol(asyncio.DatagramProtocol):
                     return r.repeater_id
         return None
 
+    def _our_rf_echo(self, heard_by: RepeaterState, rf_src: bytes, dst_id: bytes) -> Optional[bytes]:
+        """`_our_echo`, for unit calls and unit data: only a peer listening where we're sending can hear
+        it, so `heard_by` must receive on the frequency that peer sends on. A network peer (a bot, a
+        gateway: no frequency) sending the same src → dst again is a new call, not an echo."""
+        echo = self._our_echo(heard_by, rf_src, dst_id)
+        if echo is None:
+            return None
+        rx = parse_freq_hz(heard_by.rx_freq)
+        sender = self._repeaters.get(echo)
+        tx = parse_freq_hz(sender.tx_freq) if sender is not None else None
+        return echo if rx and tx and freqs_match(rx, tx) else None
+
     def _echo_note(self, rf_src: bytes, dst_id: bytes, heard_by: bytes) -> str:
         """' — our own call, being sent via <peer>' when we're sending this src → dst
         right now elsewhere: a receiver hearing that transmission (harmless)."""
@@ -2668,7 +2696,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 'busy_wait_s': max(0.0, float(cfg.get('busy_wait_s', 120.0)))}
 
     def _unit_data_start(self, stream: StreamState, decoded: Optional[Dict[str, Any]], forwarded: bool,
-                         targets: set, is_broadcast: bool, src_int: int, dst_int: int) -> None:
+                         targets: set, is_broadcast: bool, src_int: int, dst_int: int,
+                         single: bool = False) -> None:
         """A unit data stream from a local peer: report it as a unit call is
         reported (routed / on_air / failed) and keep a record of it until its
         outcome is known. Response packets aren't reported themselves: they
@@ -2684,13 +2713,13 @@ class HBProtocol(asyncio.DatagramProtocol):
         now = time()
         rec = UnitDataTx(stream_id=stream_id, rf_src=stream.rf_src, dst_id=stream.dst_id,
                          source_rid=stream.repeater_id, slot=stream.slot, started=now, last_seen=now,
-                         packets=[] if self._unit_data_retry_cfg() else None)
+                         packets=[] if self._unit_data_retry_cfg() and not single else None)
         stream.unit_data = rec
         self._unit_data_track(rec)
         reason = self._route_reason.pop(stream_id, None)
         if not targets:
             rec.failed_reason = reason or 'no route'
-            if not self._unit_data_retry_cfg():
+            if not self._unit_data_retry_cfg() or single:    # a lone CSBK: its sender asks again
                 self._unit_data_finish(rec, 'failed', rec.failed_reason)
         elif is_broadcast:
             self._unit_call_status(stream_id, src_int, dst_int, 'routed', 'broadcast')
